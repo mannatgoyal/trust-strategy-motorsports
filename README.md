@@ -19,8 +19,8 @@ $$\text{Pace}_{\text{normalized}} = \text{LapTime} - \beta \cdot (\text{Remainin
 
 ### Chapter 2: Pit Lane Gaps & Track Congestion (Congestion Games)
 Pitting costs a fixed track delta ($22.0\text{s}$). Rejoining within a $1.5\text{s}$ window of another car forces the driver into **dirty air** (aerodynamic wake), which reduces downforce and accelerates thermal wear. The solver applies a dynamic **congestion penalty** if:
-$$\text{ExitGap}_k < 1.5\text{s}$$
-$$\text{ExitGap}_k = T_{\text{exit}} - \max \{ T_{j, k} \mid T_{j, k} < T_{\text{exit}} \}$$
+$$\text{ExitGap}\_k < 1.5\text{s}$$
+$$\text{ExitGap}\_k = T\_{\text{exit}} - \max \{ T\_{j, k} \mid T\_{j, k} < T\_{\text{exit}} \}$$
 
 ### Chapter 3: Strategy Optimization (Nash vs. Stackelberg)
 The tool models the competition as a two-player game:
@@ -28,8 +28,8 @@ The tool models the competition as a two-player game:
 *   **Stackelberg Leadership (Aggressive)**: An aggressive, first-mover profile pushing early to break the DRS interval, accepting higher tire wear.
 
 ### Chapter 5: Stochastic Strategy (Safety Car Modeling)
-A Safety Car (SC) or Virtual Safety Car (VSC) reduces track speeds, cutting the time cost of a pit stop from $22.0\text{s}$ to $12.0\text{s}$. We compute expected payoffs across safety car probability distributions $P(\text{SC}_k)$:
-$$U_{\text{expected}}(S_i, S_j) = (1 - P(\text{SC}_k)) \cdot U_{\text{green}}(S_i, S_j) + P(\text{SC}_k) \cdot U_{\text{sc}}(S_i, S_j)$$
+A Safety Car (SC) or Virtual Safety Car (VSC) reduces track speeds, cutting the time cost of a pit stop from $22.0\text{s}$ to $12.0\text{s}$. We compute expected payoffs across safety car probability distributions $P(\text{SC}\_k)$:
+$$U\_{\text{expected}}(S_i, S_j) = (1 - P(\text{SC}\_k)) \cdot U\_{\text{green}}(S_i, S_j) + P(\text{SC}\_k) \cdot U\_{\text{sc}}(S_i, S_j)$$
 
 ---
 
