@@ -8,6 +8,7 @@ import plotly.express as px
 # Import custom backend modules
 from src.game_theory import GameTheoryStrategist
 from src.trust_analysis import TrustAnalyzer
+from src.differential_games import F1TrajectoryOptimizer
 
 # ========== Configuration ==========
 AVAILABLE_RACES = [
@@ -308,6 +309,58 @@ def plot_sc_probability(data, sc_probs):
     fig.update_yaxes(title_text="Probability (0-1)", range=[0, max(sc_probs.max() + 0.05, 0.1)])
     return fig
 
+def plot_control_trajectories(laps_seq, u, b):
+    """Plot throttle and ERS boost optimal control trajectories"""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=laps_seq, y=u,
+        name="Optimal Throttle/Push (u)",
+        line=dict(color='#3b82f6', width=3),
+        mode='lines+markers',
+        hovertemplate='Lap %{x}<br>Throttle: %{y:.2f}<extra></extra>'
+    ))
+    fig.add_trace(go.Scatter(
+        x=laps_seq, y=b,
+        name="Optimal ERS Boost (b)",
+        line=dict(color='#e10600', width=3),
+        mode='lines+markers',
+        hovertemplate='Lap %{x}<br>ERS Boost: %{y:.2f}<extra></extra>'
+    ))
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Optimal Control Trajectories (Pacing & Energy)", font=dict(size=16, color='#f3f4f6')),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.update_xaxes(title_text="Lap Number")
+    fig.update_yaxes(title_text="Control Level")
+    return fig
+
+def plot_state_variables(laps_seq, h, E):
+    """Plot tire health and battery state transitions"""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=laps_seq, y=h,
+        name="Tire Health (h)",
+        line=dict(color='#10b981', width=3),
+        mode='lines+markers',
+        hovertemplate='Lap %{x}<br>Tire Health: %{y:.2%}<extra></extra>'
+    ))
+    fig.add_trace(go.Scatter(
+        x=laps_seq, y=E,
+        name="Battery SoC (MJ)",
+        line=dict(color='#eab308', width=3),
+        mode='lines+markers',
+        hovertemplate='Lap %{x}<br>Battery Energy: %{y:.2f} MJ<extra></extra>'
+    ))
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Vehicle State Transitions", font=dict(size=16, color='#f3f4f6')),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.update_xaxes(title_text="Lap Number")
+    fig.update_yaxes(title_text="State Quantities")
+    return fig
+
 # ========== Streamlit Interface & Custom Styles ==========
 st.set_page_config(page_title="F1 Strategy Engineer Toolkit", layout="wide")
 
@@ -349,7 +402,7 @@ h1, h2, h3, h4, h5, h6 {
 """, unsafe_allow_html=True)
 
 st.title("F1 Strategy Engineer Toolkit")
-st.caption("Game Theory & Machine Learning System - v3.0 | July 2026")
+st.caption("Game Theory & Machine Learning System - v4.0 | July 2026")
 
 # === Controls ===
 with st.sidebar:
@@ -368,6 +421,13 @@ with st.sidebar:
                            help="Display simulated telemetry matrices for review")
     advanced_view = st.checkbox("Display Advanced Statistics", value=False,
                                help="Expose differential and correlation plots")
+    
+    st.markdown("---")
+    st.subheader("Optimal Control Tuning")
+    regen_eff = st.slider("ERS Regen Efficiency", min_value=0.2, max_value=1.5, value=0.8, step=0.1,
+                          help="Amount of battery energy recovered during lift-and-coast per lap.")
+    min_tire_target = st.slider("Min Stint Tyre Limit", min_value=0.05, max_value=0.50, value=0.15, step=0.05,
+                                help="Target structural tire health threshold remaining at stint end.")
 
 # Load Race Data
 data = load_race_data(year, track, driver)
@@ -625,7 +685,38 @@ if not data.empty and not show_demo:
             
     st.markdown("---")
     
-    # === Section 6: Circuit Constraints ===
+    # === Chapter 6: Continuous Control & Differential Games ===
+    st.header("Chapter 6: Continuous Control and Differential Games")
+    st.markdown("""
+    Race strategy is not just about discrete decisions. A driver continuously optimizes throttle control $u_k$ (tyre preservation) 
+    and energy deployment $b_k$ (battery deployment) to minimize lap time while keeping tire wear above structural safety thresholds 
+    and battery state-of-charge positive.
+    
+    We solve this trajectory pacing problem using a **dynamic optimal control solver (SLSQP)**.
+    """)
+    
+    optimizer = F1TrajectoryOptimizer(
+        base_trust=data['Trust'].values, 
+        regen_efficiency=regen_eff, 
+        min_tire_health=min_tire_target
+    )
+    opt_results = optimizer.optimize_stint()
+    
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        st.plotly_chart(plot_control_trajectories(data['LapNumber'], opt_results['u'], opt_results['b']), use_container_width=True)
+    with col_c2:
+        st.plotly_chart(plot_state_variables(data['LapNumber'], opt_results['h'], opt_results['E']), use_container_width=True)
+        
+    st.markdown("""
+    *Optimization Insights*:
+    *   **Throttle profile**: Shows where the driver must lift-and-coast (lower throttle) to preserve tyres or push on key sectors.
+    *   **ERS Boost profile**: Deploys extra electric energy when battery levels are high, and recharges (flat lines) during high-wear phases.
+    """)
+    
+    st.markdown("---")
+    
+    # === Section 7: Circuit Constraints ===
     st.header("Circuit Parameters")
     track_characteristics = {
         "Silverstone": {"tire_deg": "High", "overtaking": "Medium", "key_sectors": "Sectors 1 & 2"},
@@ -660,7 +751,7 @@ if not data.empty and not show_demo:
             *   **Focus**: Prioritize tyre temperature stabilization on out-laps.
             """)
         
-    # === Section 7: Advanced View ===
+    # === Section 8: Advanced View ===
     if advanced_view:
         st.header("Advanced Statistical Analysis")
         col_adv1, col_adv2 = st.columns(2)
@@ -718,7 +809,7 @@ else:
     strategist = GameTheoryStrategist(mock_data)
     nash = strategist.nash_equilibrium()
     stackelberg = strategist.stackelberg_leadership()
-    sc_probs = strategist.calculate_sc_probability(track="Silverstone")
+    sc_probs = strategist.calculate_sc_probability("Silverstone")
     nash_payoff, stackelberg_payoff = strategist.calculate_expected_payoff(nash, stackelberg, sc_probs)
     
     # Render interactive graphs
@@ -735,3 +826,17 @@ else:
     ])[:15]
     
     st.plotly_chart(plot_feature_importance_heatmap(demo_importances), use_container_width=True)
+    
+    # Chapter 6 in Demo Mode
+    optimizer = F1TrajectoryOptimizer(
+        base_trust=mock_data['Trust'].values, 
+        regen_efficiency=regen_eff, 
+        min_tire_health=min_tire_target
+    )
+    opt_results = optimizer.optimize_stint()
+    
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        st.plotly_chart(plot_control_trajectories(mock_data['LapNumber'], opt_results['u'], opt_results['b']), use_container_width=True)
+    with col_c2:
+        st.plotly_chart(plot_state_variables(mock_data['LapNumber'], opt_results['h'], opt_results['E']), use_container_width=True)

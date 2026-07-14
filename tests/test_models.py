@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from src.game_theory import GameTheoryStrategist
 from src.trust_analysis import TrustAnalyzer
+from src.differential_games import F1TrajectoryOptimizer
 
 class TestMotorsportsModels(unittest.TestCase):
     
@@ -163,6 +164,38 @@ class TestMotorsportsModels(unittest.TestCase):
         # Expected utility must be exactly the weighted average: 0.6 * green + 0.4 * sc
         weighted_average = 0.6 * ut_green + 0.4 * ut_sc
         self.assertAlmostEqual(expected_a, weighted_average, places=5)
+
+    def test_trajectory_optimizer_solving(self):
+        optimizer = F1TrajectoryOptimizer(
+            base_trust=self.mock_data['Trust'].values, 
+            regen_efficiency=0.8, 
+            min_tire_health=0.15
+        )
+        res = optimizer.optimize_stint()
+        
+        # Verify result contains the optimal profiles
+        self.assertTrue(res['success'])
+        self.assertEqual(len(res['u']), self.laps_count)
+        self.assertEqual(len(res['b']), self.laps_count)
+        self.assertEqual(len(res['h']), self.laps_count)
+        self.assertEqual(len(res['E']), self.laps_count)
+
+    def test_trajectory_optimizer_constraints(self):
+        min_tire = 0.20
+        optimizer = F1TrajectoryOptimizer(
+            base_trust=self.mock_data['Trust'].values, 
+            regen_efficiency=0.6, 
+            min_tire_health=min_tire
+        )
+        res = optimizer.optimize_stint()
+        
+        # 1. Final tire health constraint verification (must be >= min_tire - tolerance)
+        final_h = res['h'][-1]
+        self.assertGreaterEqual(final_h, min_tire - 1e-4)
+        
+        # 2. Battery SoC constraint verification (must remain non-negative and <= 4.0)
+        self.assertTrue(np.all(res['E'] >= -1e-4))
+        self.assertTrue(np.all(res['E'] <= 4.0 + 1e-4))
 
 if __name__ == '__main__':
     unittest.main()
