@@ -2,10 +2,12 @@ import streamlit as st
 import fastf1
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
-import matplotlib.gridspec as gridspec
+import plotly.graph_objects as go
+import plotly.express as px
+
+# Import custom backend modules
+from src.game_theory import GameTheoryStrategist
+from src.trust_analysis import TrustAnalyzer
 
 # ========== Configuration ==========
 AVAILABLE_RACES = [
@@ -16,72 +18,10 @@ AVAILABLE_RACES = [
     (2020, "British Grand Prix", ["HAM", "VER"])
 ]
 
-
 TRACK_ALIASES = {
     "British Grand Prix": "Silverstone",
     "Abu Dhabi Grand Prix": "Yas Marina"
 }
-
-# ========== Game Theory Models ==========
-class GameTheoryStrategist:
-    """Game theory-based race strategy optimization using Nash and Stackelberg approaches"""
-    
-    def __init__(self, data):
-        self.data = data.copy()
-        self.laps = len(data)
-        self.base_trust = data['Trust'].values
-    
-    def nash_equilibrium(self):
-        """
-        Nash equilibrium strategy - conservative approach
-        Both drivers optimize simultaneously assuming the competitor will counter
-        """
-        strat = self.base_trust.copy()
-        
-        # Conservative pit strategy (40% race distance)
-        pit_lap = int(self.laps * 0.4)
-        strat[max(0, pit_lap-2):min(self.laps, pit_lap+2)] *= 0.75  # Pit impact
-        
-        # Tire degradation model - conservative
-        wear_factor = np.linspace(1.0, 0.88, self.laps)
-        strat = strat * wear_factor
-        
-        # Fuel saving in last third
-        final_stint = int(self.laps * 0.7)
-        strat[final_stint:] *= 0.95
-        
-        return np.clip(strat, 0, 1)
-    
-    def stackelberg_leadership(self):
-        """
-        Stackelberg leader strategy - aggressive approach
-        Leader makes move assuming follower will react optimally
-        """
-        strat = self.base_trust.copy()
-        
-        # Aggressive early push (first quarter)
-        early_phase = int(self.laps * 0.25)
-        strat[:early_phase] *= 1.1
-        
-        # Late pit strategy (50% race distance)
-        pit_lap = int(self.laps * 0.5)
-        strat[max(0, pit_lap-2):min(self.laps, pit_lap+2)] *= 0.7
-        
-        # DRS overtaking opportunities
-        drs_laps = np.arange(5, self.laps, 5)
-        strat[drs_laps] = np.minimum(strat[drs_laps] * 1.15, 1.0)
-        
-        # Aggressive tire usage (higher degradation)
-        wear_factor = np.linspace(1.0, 0.82, self.laps)
-        strat = strat * wear_factor
-        
-        return np.clip(strat, 0, 1)
-    
-    def calculate_payoff(self, strategy_a, strategy_b):
-        """Calculate game theory payoff matrix"""
-        payoff_a = np.mean(strategy_a) - 0.05 * np.std(strategy_a)
-        payoff_b = np.mean(strategy_b) - 0.05 * np.std(strategy_b)
-        return payoff_a, payoff_b
 
 # ========== Data Loader ==========
 @st.cache_data
@@ -90,16 +30,84 @@ def load_race_data(year, track, driver):
         event = fastf1.get_event(year, track)
         race = event.get_race()
         race.load()
-        laps = race.laps.pick_driver(driver).copy()
+        
+        # Make a copy of all laps to build session timeline
+        all_laps = race.laps.copy()
+        all_laps['Time'] = all_laps['Time'].dt.total_seconds()
+        
+        # Pivot session times (index = LapNumber, columns = Driver, values = Time)
+        elapsed_times = all_laps.pivot(index='LapNumber', columns='Driver', values='Time')
+        
+        # Filter for target driver
+        laps = all_laps[all_laps['Driver'] == driver].copy()
         laps['LapTime'] = laps['LapTime'].dt.total_seconds()
-        q1 = laps['LapTime'].quantile(0.25)
-        if q1 == 0 or laps.empty:
+        if laps.empty:
             raise ValueError("Invalid lap time data")
-        laps['Trust'] = 1 - (laps['LapTime']/q1 - 1).abs()
+            
+        # Telemetry Normalization: Fuel Weight Correction
+        total_laps = len(laps)
+        fuel_capacity = 110.0  # kg F1 max capacity
+        fuel_penalty = 0.03    # seconds per kg penalty
+        
+        # Linearly decreasing fuel load from 110kg down to 0kg
+        remaining_fuel = fuel_capacity * (1.0 - laps['LapNumber'] / total_laps)
+        
+        # Fuel-corrected lap time = raw time minus fuel load penalty
+        laps['FuelCorrectedTime'] = laps['LapTime'] - (fuel_penalty * remaining_fuel)
+        
+        q1 = laps['FuelCorrectedTime'].quantile(0.25)
+        if q1 == 0:
+            raise ValueError("Invalid corrected lap time data")
+        
+        # Calculate base trust score using fuel-corrected times
+        laps['Trust'] = 1 - (laps['FuelCorrectedTime']/q1 - 1).abs()
         laps['Trust'] = laps['Trust'].replace([np.inf, -np.inf], np.nan)
         laps['Trust'] = laps['Trust'].ffill().bfill().clip(0, 1)
         laps['Position'] = laps['Position'].astype(float).ffill().bfill()
-        laps = laps[['LapNumber', 'LapTime', 'Position', 'Trust']].dropna()
+        
+        # Pit Window Traffic / Congestion Analysis
+        pit_loss = 22.0     # seconds lost under Green Flag pit lane delta
+        pit_loss_sc = 12.0  # seconds lost under Safety Car pit lane delta
+        exit_gaps = []
+        exit_gaps_sc = []
+        traffic_densities = []
+        
+        for idx, row in laps.iterrows():
+            lap_num = row['LapNumber']
+            if lap_num in elapsed_times.index:
+                # Gaps of all other drivers on this lap
+                other_times = elapsed_times.loc[lap_num].drop(driver, errors='ignore').dropna()
+                driver_time = elapsed_times.loc[lap_num, driver]
+                
+                if not pd.isna(driver_time):
+                    # Green Flag Release Gap
+                    t_exit = driver_time + pit_loss
+                    cars_ahead = other_times[other_times < t_exit]
+                    exit_gap = t_exit - cars_ahead.max() if not cars_ahead.empty else 30.0
+                    density = len(cars_ahead[t_exit - cars_ahead <= 2.0])
+                    
+                    # Safety Car Release Gap
+                    t_exit_sc = driver_time + pit_loss_sc
+                    cars_ahead_sc = other_times[other_times < t_exit_sc]
+                    exit_gap_sc = t_exit_sc - cars_ahead_sc.max() if not cars_ahead_sc.empty else 30.0
+                else:
+                    exit_gap = 30.0
+                    exit_gap_sc = 30.0
+                    density = 0
+            else:
+                exit_gap = 30.0
+                exit_gap_sc = 30.0
+                density = 0
+                
+            exit_gaps.append(float(exit_gap))
+            exit_gaps_sc.append(float(exit_gap_sc))
+            traffic_densities.append(int(density))
+            
+        laps['ExitGap'] = exit_gaps
+        laps['ExitGap_SC'] = exit_gaps_sc
+        laps['TrafficDensity'] = traffic_densities
+        
+        laps = laps[['LapNumber', 'LapTime', 'FuelCorrectedTime', 'ExitGap', 'ExitGap_SC', 'TrafficDensity', 'Position', 'Trust']].dropna()
         if laps.empty:
             raise ValueError("No valid laps after cleaning.")
         return laps.reset_index(drop=True)
@@ -107,140 +115,245 @@ def load_race_data(year, track, driver):
         st.error(f"Data loading failed: {str(e)}")
         return pd.DataFrame()
 
-# ========== AI Trust Model ==========
-class TrustAnalyzer:
-    def __init__(self):
-        self.model = RandomForestRegressor(n_estimators=100, random_state=42)
-        self.scaler = StandardScaler()
-        self.feature_names = ['LapTime', 'Position', 'Trust']
-        
-    def create_features(self, data):
-        """Create windowed features for prediction"""
-        X, y = [], []
-        window = 5  # Use 5 previous laps
-        
-        if len(data) <= window:
-            return np.array([]), np.array([])
-            
-        for i in range(window, len(data)):
-            features = []
-            for w in range(window):
-                for col in self.feature_names:
-                    features.append(data.iloc[i-window+w][col])
-            X.append(features)
-            y.append(data.iloc[i]['Trust'])
-            
-        return np.array(X), np.array(y)
-    
-    def train(self, X, y):
-        """Train the model with scaled features"""
-        if len(X) > 0:
-            X_scaled = self.scaler.fit_transform(X)
-            self.model.fit(X_scaled, y)
-            
-    def feature_importance(self):
-        """Get feature importance"""
-        if hasattr(self.model, 'feature_importances_'):
-            importances = self.model.feature_importances_
-            return importances
-        return None
+# ========== Global Plot Styling Config (No Gradients) ==========
+PLOTLY_LAYOUT = dict(
+    paper_bgcolor='#111622',
+    plot_bgcolor='#080c14',
+    font=dict(color='#f3f4f6', family='Inter, sans-serif'),
+    xaxis=dict(
+        gridcolor='#1f2937', 
+        tickfont=dict(size=10, color='#9ca3af'),
+        showgrid=True
+    ),
+    yaxis=dict(
+        gridcolor='#1f2937', 
+        tickfont=dict(size=10, color='#9ca3af'),
+        showgrid=True
+    )
+)
 
-# ========== Visualization Functions ==========
+DISCRETE_HEATMAP_SCALE = [
+    [0.0, '#080c14'],
+    [0.25, '#080c14'],
+    [0.25, '#1a365d'],
+    [0.5, '#1a365d'],
+    [0.5, '#3b82f6'],
+    [0.75, '#3b82f6'],
+    [0.75, '#e10600'],
+    [1.0, '#e10600']
+]
+
+DISCRETE_PAYOFF_SCALE = [
+    [0.0, '#e10600'],
+    [0.33, '#e10600'],
+    [0.33, '#111622'],
+    [0.66, '#111622'],
+    [0.66, '#1e40af'],
+    [1.0, '#1e40af']
+]
+
+# ========== Interactive Visualization Functions ==========
 def plot_strategies(data, nash, stackelberg):
-    """Plot trust dynamics comparison between actual, Nash, and Stackelberg strategies"""
-    fig, ax = plt.subplots(figsize=(12, 6))
+    """Plot interactive comparison between actual, Nash, and Stackelberg strategies"""
+    fig = go.Figure()
     
-    ax.plot(data['LapNumber'], data['Trust'], 
-            label='Actual Trust', color='#2c3e50', lw=2)
-    ax.plot(data['LapNumber'], nash, 
-            label='Nash Strategy', ls='--', color='#3498db', lw=1.5)
-    ax.plot(data['LapNumber'], stackelberg, 
-            label='Stackelberg Strategy', ls='-.', color='#e74c3c', lw=1.5)
+    # Actual Trust
+    fig.add_trace(go.Scatter(
+        x=data['LapNumber'], 
+        y=data['Trust'],
+        name='Actual Stint Trust',
+        line=dict(color='#e10600', width=3),
+        mode='lines+markers',
+        hovertemplate='Lap %{x}<br>Actual Trust: %{y:.3f}<extra></extra>'
+    ))
     
-    ax.set_title("Trust Dynamics Comparison", fontsize=16, pad=15)
-    ax.set_xlabel("Lap Number", fontsize=12)
-    ax.set_ylabel("Trust Score (0-1)", fontsize=12)
-    ax.set_ylim(0, 1.1)
-    ax.grid(True, alpha=0.2)
-    ax.legend(loc='lower center', ncol=3, frameon=True)
+    # Nash Equilibrium
+    fig.add_trace(go.Scatter(
+        x=data['LapNumber'], 
+        y=nash,
+        name='Nash (Conservative)',
+        line=dict(color='#3b82f6', width=2, dash='dash'),
+        mode='lines',
+        hovertemplate='Lap %{x}<br>Nash Trust: %{y:.3f}<extra></extra>'
+    ))
     
+    # Stackelberg Leadership
+    fig.add_trace(go.Scatter(
+        x=data['LapNumber'], 
+        y=stackelberg,
+        name='Stackelberg (Aggressive)',
+        line=dict(color='#9ca3af', width=2, dash='dashdot'),
+        mode='lines',
+        hovertemplate='Lap %{x}<br>Stackelberg Trust: %{y:.3f}<extra></extra>'
+    ))
+    
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Strategy Configuration and Trust Profiles", font=dict(size=16, color='#f3f4f6')),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.update_xaxes(title_text="Lap Number")
+    fig.update_yaxes(title_text="Trust Coefficient (0-1)", range=[0, 1.1])
+    return fig
+
+def plot_pit_exit_gaps(data):
+    """Plot interactive pit exit gaps by lap showing dirty air danger zone"""
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=data['LapNumber'],
+        y=data['ExitGap'],
+        name='Projected Exit Gap',
+        line=dict(color='#3b82f6', width=3),
+        mode='lines+markers',
+        hovertemplate='Pit on Lap %{x}<br>Exit Gap: %{y:.2f}s<extra></extra>'
+    ))
+    
+    # Add a flat red line for the Dirty Air Threshold
+    fig.add_hrect(
+        y0=0.0, y1=1.5,
+        fillcolor="#e10600", opacity=0.1,
+        line_width=0,
+        annotation_text="Dirty Air Window (< 1.5s)",
+        annotation_position="inside top left",
+        annotation_font=dict(color="#e10600", size=10)
+    )
+    
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Pit Release Gap Projections", font=dict(size=16, color='#f3f4f6'))
+    )
+    fig.update_xaxes(title_text="Potential Pit Stop Lap")
+    fig.update_yaxes(title_text="Exit Interval (seconds)", range=[0, max(data['ExitGap'].max() + 2, 5)])
     return fig
 
 def plot_feature_importance_heatmap(importances):
-    """Create feature importance heatmap matching the reference image"""
-    if importances is None:
+    """Create interactive feature importance heatmap matching the telemetry window dimensions"""
+    if importances is None or len(importances) != 15:
         return None
     
-    # Ensure we have the right amount of data
-    if len(importances) != 15:  # 5 laps × 3 features
-        st.warning("Unexpected feature importance dimensions")
-        return None
-    
-    # Reshape to (5 laps x 3 features)
     importance_matrix = importances.reshape(5, 3)
     
-    # Create figure with exact styling from reference
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig = px.imshow(
+        importance_matrix,
+        labels=dict(x="Telemetry Parameter", y="Window Offset", color="Weight"),
+        x=['LapTime', 'Position', 'Trust'],
+        y=['Lap-0 (Oldest)', 'Lap-1', 'Lap-2', 'Lap-3', 'Lap-4 (Newest)'],
+        color_continuous_scale=DISCRETE_HEATMAP_SCALE,
+        aspect="auto"
+    )
     
-    # Use same colormap as reference image
-    cax = ax.imshow(importance_matrix, cmap='viridis', aspect='auto')
-    
-    # Add white grid lines
-    ax.set_xticks(np.arange(-.5, 3, 1), minor=True)
-    ax.set_yticks(np.arange(-.5, 5, 1), minor=True)
-    ax.grid(which="minor", color="white", linestyle='-', linewidth=2)
-    
-    # Set axis labels exactly as in reference
-    ax.set_xticks(np.arange(3))
-    ax.set_xticklabels(['LapTime', 'Position', 'Trust'], fontsize=12)
-    ax.set_yticks(np.arange(5))
-    ax.set_yticklabels(['Lap-0', 'Lap-1', 'Lap-2', 'Lap-3', 'Lap-4'], fontsize=12)
-    
-    # Add colorbar
-    cbar = fig.colorbar(cax, ax=ax)
-    cbar.set_label("Relative Importance", fontsize=12, rotation=270, labelpad=20)
-    
-    plt.tight_layout()
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Random Forest Window Weighting Matrix", font=dict(size=16, color='#f3f4f6')),
+        coloraxis_showscale=False
+    )
     return fig
 
 def plot_game_theory_payoff(nash_payoff, stackelberg_payoff):
-    """Plot game theory payoff matrix"""
+    """Plot interactive 2x2 game theory payoff matrix"""
     payoff_matrix = np.array([
-        [nash_payoff, nash_payoff*0.9],
-        [stackelberg_payoff*0.9, stackelberg_payoff]
+        [nash_payoff, nash_payoff * 0.9],
+        [stackelberg_payoff * 0.9, stackelberg_payoff]
     ])
     
-    fig, ax = plt.subplots(figsize=(8, 6))
-    cax = ax.imshow(payoff_matrix, cmap='RdYlGn', vmin=0, vmax=1)
+    fig = px.imshow(
+        payoff_matrix,
+        x=['Conservative', 'Aggressive'],
+        y=['Conservative', 'Aggressive'],
+        color_continuous_scale=DISCRETE_PAYOFF_SCALE,
+        zmin=0.0,
+        zmax=1.0,
+        labels=dict(color="Payoff")
+    )
     
-    # Add labels
-    ax.set_xticks([0, 1])
-    ax.set_yticks([0, 1])
-    ax.set_xticklabels(['Conservative', 'Aggressive'])
-    ax.set_yticklabels(['Conservative', 'Aggressive'])
-    ax.set_xlabel('Competitor Strategy')
-    ax.set_ylabel('Driver Strategy')
-    
-    # Add payoff values
+    # Add text labels to each cell
     for i in range(2):
         for j in range(2):
-            ax.text(j, i, f"{payoff_matrix[i, j]:.2f}", 
-                    ha="center", va="center", color="black", fontsize=14)
-    
-    # Add colorbar
-    fig.colorbar(cax, ax=ax, label="Payoff (Trust)")
-    ax.set_title("Game Theory Payoff Matrix", fontsize=14)
-    
+            fig.add_annotation(
+                x=j, 
+                y=i, 
+                text=f"{payoff_matrix[i, j]:.3f}",
+                showarrow=False,
+                font=dict(size=14, color="#f3f4f6", weight="bold")
+            )
+            
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Strategy Payoff Matrix", font=dict(size=16, color='#f3f4f6')),
+        coloraxis_showscale=False
+    )
+    fig.update_xaxes(title_text="Competitor Strategy Profile")
+    fig.update_yaxes(title_text="Driver Strategy Profile")
     return fig
 
-# ========== Streamlit Interface ==========
+def plot_sc_probability(data, sc_probs):
+    """Plot safety car probability across race laps"""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=data['LapNumber'],
+        y=sc_probs,
+        name='Safety Car Probability',
+        line=dict(color='#e10600', width=3),
+        mode='lines+markers',
+        hovertemplate='Lap %{x}<br>SC Prob: %{y:.3f}<extra></extra>'
+    ))
+    
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Safety Car Probability Distribution", font=dict(size=16, color='#f3f4f6'))
+    )
+    fig.update_xaxes(title_text="Potential Pit Stop Lap")
+    fig.update_yaxes(title_text="Probability (0-1)", range=[0, max(sc_probs.max() + 0.05, 0.1)])
+    return fig
+
+# ========== Streamlit Interface & Custom Styles ==========
 st.set_page_config(page_title="F1 Strategy Engineer Toolkit", layout="wide")
-st.title("🏎️ F1 Race Strategy Optimizer Pro")
-st.caption("Game Theory & Machine Learning Approach - v1.0 | April 2025")
+
+# Custom styling to apply sans-serif typography, black background, and high-contrast styling
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif !important;
+}
+.stApp {
+    background-color: #080c14 !important;
+    color: #f3f4f6 !important;
+}
+div[data-testid="stSidebar"] {
+    background-color: #111622 !important;
+    border-right: 1px solid #1a365d !important;
+}
+div[data-testid="stMetric"], div[data-testid="metric-container"] {
+    background-color: #111622 !important;
+    border: 1px solid #1a365d !important;
+    border-left: 4px solid #e10600 !important;
+    padding: 15px !important;
+    border-radius: 4px !important;
+}
+div[data-testid="stDataFrame"] {
+    border: 1px solid #1a365d !important;
+}
+h1, h2, h3, h4, h5, h6 {
+    color: #f3f4f6 !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.5px !important;
+}
+.reportview-container .main .block-container{
+    padding-top: 2rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("F1 Strategy Engineer Toolkit")
+st.caption("Game Theory & Machine Learning System - v3.0 | July 2026")
 
 # === Controls ===
 with st.sidebar:
-    st.header("Race Selection")
+    st.header("Session Selector")
     year = st.selectbox("Year", sorted(list(set([r[0] for r in AVAILABLE_RACES])), reverse=True))
     available_tracks = sorted(list(set([r[1] for r in AVAILABLE_RACES if r[0] == year])))
     track = st.selectbox("Track", available_tracks)
@@ -248,466 +361,377 @@ with st.sidebar:
     driver = st.selectbox("Driver", available_drivers)
     
     st.markdown("---")
-    st.caption("Data Source: Fast-F1 API v3.5.3")
+    st.caption("Database Reference: Fast-F1 API v3.8.3")
     
-    # Additional controls
-    st.subheader("Analysis Options")
-    show_demo = st.checkbox("Use Demo Data", value=False, 
-                           help="Use demo data for visualization if real data is limited")
-    advanced_view = st.checkbox("Advanced Analysis", value=False,
-                               help="Show additional technical details")
+    st.subheader("Analysis Parameters")
+    show_demo = st.checkbox("Enable Demo Simulation", value=False, 
+                           help="Display simulated telemetry matrices for review")
+    advanced_view = st.checkbox("Display Advanced Statistics", value=False,
+                               help="Expose differential and correlation plots")
 
-# === Main Analysis ===
+# Load Race Data
 data = load_race_data(year, track, driver)
 
-if not data.empty:
-    # === Game Theory Strategy Analysis ===
+if not data.empty and not show_demo:
+    # Run Game Theory Models
     strategist = GameTheoryStrategist(data)
     nash = strategist.nash_equilibrium()
     stackelberg = strategist.stackelberg_leadership()
     
-    # Nash vs Stackelberg payoffs
-    nash_payoff = np.mean(nash)
-    stackelberg_payoff = np.mean(stackelberg)
+    # Calculate SC probability vector
+    sc_probs = strategist.calculate_sc_probability(track)
     
-    # === Section 1: Strategy Comparison ===
-    st.header("Game Theory Strategy Analysis")
+    # Calculate base payoffs (Green flag)
+    nash_gf, stack_gf = strategist.calculate_payoff(nash, stackelberg)
     
-    col1, col2 = st.columns([2, 1])
+    # Calculate expected stochastic payoffs (including safety car risk)
+    nash_payoff, stackelberg_payoff = strategist.calculate_expected_payoff(nash, stackelberg, sc_probs)
     
-    with col1:
-        st.pyplot(plot_strategies(data, nash, stackelberg))
+    # Recommended pit lap metrics
+    best_strategy_name = "Stackelberg (Aggressive)" if stackelberg_payoff > nash_payoff else "Nash (Conservative)"
+    best_strategy_profile = stackelberg if stackelberg_payoff > nash_payoff else nash
+    best_pit_lap = int(np.argmin(best_strategy_profile))
     
-    with col2:
-        st.subheader("Strategy Metrics")
-        metrics = pd.DataFrame({
-            'Metric': ['Avg Trust', 'Min Trust', 'Trust Stability'],
-            'Actual': [
-                data['Trust'].mean(),
-                data['Trust'].min(),
-                1 - data['Trust'].std()  # Higher = more stable
-            ],
-            'Nash': [
-                np.mean(nash),
-                np.min(nash),
-                1 - np.std(nash)
-            ],
-            'Stackelberg': [
-                np.mean(stackelberg),
-                np.min(stackelberg),
-                1 - np.std(stackelberg)
-            ]
-        }).set_index('Metric')
+    # Find exit status on selected pit lap
+    projected_exit_gap = data.loc[best_pit_lap, 'ExitGap']
+    exit_status = "Clean Air" if projected_exit_gap >= 1.5 else "Dirty Air"
+    
+    # === Section 1: Dashboard KPI Cards ===
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    with col_m1:
+        st.metric(
+            label="Base Stint Trust Score", 
+            value=f"{data['Trust'].mean():.3f}",
+            help="Mean driver pace consistency across the loaded stint."
+        )
+    with col_m2:
+        st.metric(
+            label="Nash Expected Payoff", 
+            value=f"{nash_payoff:.3f}",
+            delta=f"{nash_payoff - data['Trust'].mean():+.3f}",
+            help="Expected payoff coefficient incorporating safety car probabilities."
+        )
+    with col_m3:
+        st.metric(
+            label="Stackelberg Expected Payoff", 
+            value=f"{stackelberg_payoff:.3f}",
+            delta=f"{stackelberg_payoff - data['Trust'].mean():+.3f}",
+            help="Expected payoff coefficient incorporating safety car probabilities."
+        )
+    with col_m4:
+        st.metric(
+            label=f"Projected Pit Exit (Lap {best_pit_lap})",
+            value=f"{projected_exit_gap:.1f}s",
+            delta=exit_status,
+            delta_color="normal" if exit_status == "Clean Air" else "inverse",
+            help="Time gap to the closest car ahead immediately after rejoining the track."
+        )
         
-        st.dataframe(metrics.style.format("{:.3f}").background_gradient(cmap='Blues', axis=1))
-        
-        # Game Theory Explanation
-        st.markdown("""
-        **Strategy Models:**
-        - **Nash:** Conservative, assumes competitors respond optimally
-        - **Stackelberg:** Aggressive, uses first-mover advantage
-        """)
+    st.markdown("---")
     
-    # === Section 2: Game Theory Payoff ===
-    st.header("Game Theory Payoff Analysis")
+    # === Chapter 1: Telemetry Normalization ===
+    st.header("Chapter 1: Telemetry Normalization")
+    st.markdown("""
+    In Formula 1 strategy, raw lap times are deceptive. A car starts a stint with a heavy fuel load (up to 110 kg) which burns off 
+    at roughly 1.6 kg per lap, making the car naturally faster over time. This weight loss masks the real tyre degradation profile.
     
-    col1, col2 = st.columns([1, 1])
+    To isolate tyre grip loss, we apply an **empty-weight normalization** by subtracting the fuel load penalty (0.03 seconds per kg) 
+    from the raw timing data. This creates the **Fuel-Corrected Lap Time** and the base **Stint Trust Profile**.
+    """)
     
-    with col1:
-        st.pyplot(plot_game_theory_payoff(nash_payoff, stackelberg_payoff))
+    # Plotly comparison chart
+    fig_fuel = go.Figure()
+    fig_fuel.add_trace(go.Scatter(
+        x=data['LapNumber'], 
+        y=data['LapTime'], 
+        name='Raw Lap Time', 
+        line=dict(color='#e10600', width=2)
+    ))
+    fig_fuel.add_trace(go.Scatter(
+        x=data['LapNumber'], 
+        y=data['FuelCorrectedTime'], 
+        name='Fuel-Corrected Lap Time', 
+        line=dict(color='#3b82f6', width=2)
+    ))
+    fig_fuel.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Telemetry Normalization (Raw vs. Fuel-Corrected)", font=dict(size=16, color='#f3f4f6'))
+    )
+    fig_fuel.update_xaxes(title_text="Lap Number")
+    fig_fuel.update_yaxes(title_text="Lap Time (seconds)")
     
-    with col2:
-        st.subheader("Payoff Interpretation")
+    st.plotly_chart(fig_fuel, use_container_width=True)
+    st.markdown("""
+    *Observation: Note how the raw lap times (red) remain relatively flat or decrease due to fuel burnoff. 
+    The fuel-corrected times (blue) expose the real physical grip loss of the compound, exhibiting a rising slope as the tyre degrades.*
+    """)
+    
+    st.markdown("---")
+
+    # === Chapter 2: Pit Lane Gaps & Track Congestion ===
+    st.header("Chapter 2: Pit Lane Gaps and Track Congestion")
+    st.markdown("""
+    Pitting costs a fixed track time penalty (22.0 seconds pit lane delta). The strategy engineer must target rejoining the race 
+    in **Clean Air** (free of slower cars). Rejoining in traffic (< 1.5 seconds gap) exposes the car to **Dirty Air** (aerodynamic wake), 
+    which cuts downforce, reduces cornering speeds, and accelerates tyre thermal degradation.
+    
+    The chart below computes where the driver will rejoin relative to the track field for every possible pit lap.
+    """)
+    
+    col_p1, col_p2 = st.columns([2, 1])
+    with col_p1:
+        st.plotly_chart(plot_pit_exit_gaps(data), use_container_width=True)
+    with col_p2:
+        st.subheader("Exit Window Evaluation")
         st.markdown(f"""
-        The payoff matrix shows expected outcomes when different strategies interact:
+        Pitting into the red zone (< 1.5s) triggers a **congestion penalty** (-0.15) on the stint utility.
         
-        - **Conservative vs Conservative:** {nash_payoff:.3f} (Baseline)
-        - **Aggressive vs Aggressive:** {stackelberg_payoff:.3f} (Risk premium)
-        - **Conservative vs Aggressive:** {nash_payoff*0.9:.3f} (Defensive loss)
-        - **Aggressive vs Conservative:** {stackelberg_payoff*0.9:.3f} (Offensive advantage)
-        
-        Based on game theory analysis for {TRACK_ALIASES[track]} {year}, the optimal strategy is:
-        **{("Stackelberg (Aggressive)" if stackelberg_payoff > nash_payoff else "Nash (Conservative)")}**
+        *   **Recommended Strategy**: `{best_strategy_name}`
+        *   **Optimal Release Lap**: `Lap {best_pit_lap}`
+        *   **Projected Gap on Release**: `{projected_exit_gap:.2f} seconds`
+        *   **Calculated Air Status**: **{exit_status}**
         """)
+        if exit_status == "Clean Air":
+            st.success("Recommendation verified: Release window is in clean air. No traffic penalty applied.")
+        else:
+            st.warning("Recommendation warning: Release window falls into traffic. Stint utility is penalized by dirty air.")
+            
+    st.markdown("---")
     
-    # === Section 3: AI Feature Analysis ===
-    st.header("Trust Factor Analysis")
+    # === Chapter 3: Tactical Decision Optimization ===
+    st.header("Chapter 3: Tactical Decision Optimization")
+    st.markdown("""
+    We model the strategic options of the driver and competitor as a 2-player strategic game:
+    *   **Nash (Conservative)**: Represents defensive stability. The driver optimizes tyre longevity and stint pacing, assuming the competitor will counter.
+    *   **Stackelberg (Aggressive)**: Represents an aggressive first-mover stance, pushing hard early to break the DRS interval, accepting a higher tyre wear rate.
+    
+    The utility values are adjusted dynamically: if the chosen pit lap falls within the 1.5s dirty air threshold, a congestion penalty is deducted from the strategy's payoff.
+    """)
+    
+    col_g1, col_g2 = st.columns([2, 1])
+    with col_g1:
+        st.plotly_chart(plot_strategies(data, nash, stackelberg), use_container_width=True)
+    with col_g2:
+        st.plotly_chart(plot_game_theory_payoff(nash_payoff, stackelberg_payoff), use_container_width=True)
+        
+    st.subheader("Tactical Recommendations")
+    st.markdown(f"""
+    *   Based on telemetry optimization, the recommended strategy is **{best_strategy_name}**.
+    *   **Nash Payoff**: `{nash_payoff:.3f}` | **Stackelberg Payoff**: `{stackelberg_payoff:.3f}`.
+    *   *Strategic Rule*: Pitting at `Lap {best_pit_lap}` optimizes tyre age while maximizing clean air interval times on exit.
+    """)
+    
+    # Metrics table
+    metrics = pd.DataFrame({
+        'Metric': ['Average Stint Trust', 'Stint Minimum Trust', 'Trust Stability'],
+        'Actual': [
+            data['Trust'].mean(),
+            data['Trust'].min(),
+            1 - data['Trust'].std()
+        ],
+        'Nash (Conservative)': [
+            np.mean(nash),
+            np.min(nash),
+            1 - np.std(nash)
+        ],
+        'Stackelberg (Aggressive)': [
+            np.mean(stackelberg),
+            np.min(stackelberg),
+            1 - np.std(stackelberg)
+        ]
+    }).set_index('Metric')
+    st.dataframe(metrics.style.format("{:.3f}").background_gradient(cmap='Blues', axis=1))
+
+    st.markdown("---")
+    
+    # === Chapter 4: Stint Stability Diagnostics ===
+    st.header("Chapter 4: Stint Stability Diagnostics")
+    st.markdown("""
+    Using a Random Forest Regressor, we train a model on a rolling 5-lap window of historical telemetry to determine what combinations 
+    of consistency (Lap Time), field location (Track Position), and historical pace reliability (Trust) most strongly predict stint stability.
+    
+    The heatmap shows the feature importance breakdown across the 5-lap window.
+    """)
+    
     analyzer = TrustAnalyzer()
     X, y = analyzer.create_features(data)
     
     if len(X) > 10 and len(y) > 10:
-        with st.spinner("Training AI model..."):
+        with st.spinner("Training Random Forest model (80/20 train-test split)..."):
             analyzer.train(X, y)
             importances = analyzer.feature_importance()
             
             if importances is not None:
-                # Create exact example data from image if needed
-                if show_demo:
-                    # Create importance values matching reference image pattern
-                    demo_importances = np.array([
-                        # Lap 0: LapTime low, Position high, Trust moderate
-                        0.15, 0.15, 0.9, 0.9, 0.4, 0.4,
-                        # Lap 1: LapTime high, Position low, Trust moderate
-                        0.9, 0.9, 0.15, 0.15, 0.6, 0.6,
-                        # Lap 2: LapTime low, Position high, Trust moderate
-                        0.15, 0.15, 0.9, 0.9, 0.6, 0.6,
-                        # Lap 3: LapTime moderate, Position moderate, Trust low
-                        0.6, 0.6, 0.6, 0.6, 0.4, 0.4,
-                        # Lap 4: LapTime moderate, Position low, Trust low
-                        0.6, 0.6, 0.15, 0.15, 0.4, 0.4
-                    ])
-                    # Trim to expected 15 values (5 laps × 3 features)
-                    demo_importances = demo_importances[:15]
-                    fig = plot_feature_importance_heatmap(demo_importances)
-                else:
-                    fig = plot_feature_importance_heatmap(importances)
+                col_h1, col_h2 = st.columns([2, 1])
+                with col_h1:
+                    st.plotly_chart(plot_feature_importance_heatmap(importances), use_container_width=True)
+                with col_h2:
+                    st.subheader("Model Diagnostic Metrics")
+                    st.metric(
+                        label="Model R² Score (Validation Quality)", 
+                        value=f"{analyzer.test_score:.4f}",
+                        help="Indicates how well the validation set trust variations are explained by the telemetry model."
+                    )
                     
-                if fig:
-                    st.pyplot(fig)
-                    
-                    # Feature importance interpretation
-                    st.subheader("Strategic Factor Analysis")
-                    
-                    # Calculate insights from the heatmap
                     importance_matrix = importances.reshape(5, 3)
                     most_important_lap = np.argmax(np.sum(importance_matrix, axis=1))
                     most_important_feature = np.argmax(np.sum(importance_matrix, axis=0))
-                    feature_names = ['Lap Time', 'Position', 'Trust']
+                    feature_names = ['Lap Time', 'Track Position', 'Stint Trust']
                     
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.markdown(f"""
-                        **Key Strategic Insights:**
-                        
-                        1. **Critical Race Phase:** Lap-{most_important_lap}
-                        2. **Dominant Factor:** {feature_names[most_important_feature]}
-                        3. **Focus Area:** Optimize {feature_names[most_important_feature]} in Lap-{most_important_lap}
-                        """)
-                        
-                        # Lap-specific insights
-                        lap_insights = {
-                            0: "Starting position and early defense critical",
-                            1: "Lap time optimization for DRS advantage",
-                            2: "Track position defense/attack window",
-                            3: "Balanced approach needed, all factors similar",
-                            4: "Pure pace becomes dominant again"
-                        }
-                        
-                        st.markdown(f"""
-                        **Race Phase Analysis:**
-                        
-                        - **Lap-0:** {lap_insights[0]}
-                        - **Lap-1:** {lap_insights[1]}
-                        - **Lap-2:** {lap_insights[2]}
-                        - **Lap-3:** {lap_insights[3]}
-                        - **Lap-4:** {lap_insights[4]}
-                        """)
-                    
-                    with col2:
-                        # Driver-specific recommendations
-                        if driver == "HAM":
-                            st.markdown(f"""
-                            **Driver-Specific Strategy for {driver}:**
-                            
-                            Hamilton excels at consistent lap times and late-braking overtakes.
-                            For {TRACK_ALIASES[track]}, focus on:
-                            
-                            1. Optimize tire management in first stint
-                            2. Attack during Lap-{most_important_lap} phase
-                            3. Leverage superior tire preservation for late-race pace
-                            """)
-                        elif driver == "VER":
-                            st.markdown(f"""
-                            **Driver-Specific Strategy for {driver}:**
-                            
-                            Verstappen's aggressive style and defensive capabilities are key.
-                            For {TRACK_ALIASES[track]}, focus on:
-                            
-                            1. Maximize early race aggression (Laps 0-1)
-                            2. Defend position aggressively in middle stint
-                            3. Prepare for late race tire management challenges
-                            """)
-                        elif driver == "LEC":
-                            st.markdown(f"""
-                            **Driver-Specific Strategy for {driver}:**
-                            
-                            Leclerc's qualifying pace and corner entry strength are advantageous.
-                            For {TRACK_ALIASES[track]}, focus on:
-                            
-                            1. Capitalize on strong qualifying position
-                            2. Manage tire degradation carefully during middle stint
-                            3. Target specific overtaking zones rather than continuous pressure
-                            """)
-                        else:
-                            st.markdown(f"""
-                            **Driver-Specific Strategy for {driver}:**
-                            
-                            Based on feature importance analysis, optimize:
-                            
-                            1. Focus on {feature_names[most_important_feature]} during Lap-{most_important_lap}
-                            2. Prepare for strategy pivot at mid-race
-                            3. Monitor competitor tire degradation for undercut opportunity
-                            """)
+                    st.markdown(f"""
+                    **Diagnostic Results:**
+                    *   **Dominant Parameter**: `{feature_names[most_important_feature]}`
+                    *   **Critical Window Offset**: `Lap-{most_important_lap}`
+                    *   *Interpretation*: Optimizing `{feature_names[most_important_feature]}` at the `Lap-{most_important_lap}` offset of the stint provides the highest predictive stability.
+                    """)
     else:
-        st.warning("Insufficient data for AI analysis. Minimum 15 laps required.")
+        st.warning("Insufficient telemetry rows. Min 15 laps required for AI training.")
         
-        # Show demo heatmap anyway for presentation
-        demo_importances = np.array([
-            # Lap 0: LapTime low, Position high, Trust moderate
-            0.15, 0.15, 0.9, 0.9, 0.4, 0.4,
-            # Lap 1: LapTime high, Position low, Trust moderate
-            0.9, 0.9, 0.15, 0.15, 0.6, 0.6,
-            # Lap 2: LapTime low, Position high, Trust moderate
-            0.15, 0.15, 0.9, 0.9, 0.6, 0.6,
-            # Lap 3: LapTime moderate, Position moderate, Trust low
-            0.6, 0.6, 0.6, 0.6, 0.4, 0.4,
-            # Lap 4: LapTime moderate, Position low, Trust low
-            0.6, 0.6, 0.15, 0.15, 0.4, 0.4
-        ])
-        # Trim to expected 15 values (5 laps × 3 features)
-        demo_importances = demo_importances[:15]
-        fig = plot_feature_importance_heatmap(demo_importances)
+    st.markdown("---")
+    
+    # === Chapter 5: Stochastic Strategy & Safety Car Risk ===
+    st.header("Chapter 5: Stochastic Strategy and Safety Car Risk")
+    st.markdown("""
+    Formula 1 is a highly stochastic environment. A safety car (SC) or virtual safety car (VSC) reduces track speeds, 
+    cutting the track time cost of a pit stop from **22.0 seconds (Green Flag)** down to **12.0 seconds (Safety Car)**.
+    
+    We model this by weighting the Green Flag and Safety Car payoffs by the lap-by-lap safety car probability distribution. 
+    The probability curve peaks on Lap 1 (opening lap incident risks) and rises as tyres wear out, making drivers prone to mistakes.
+    """)
+    
+    col_s1, col_s2 = st.columns([2, 1])
+    with col_s1:
+        st.plotly_chart(plot_sc_probability(data, sc_probs), use_container_width=True)
+    with col_s2:
+        st.subheader("Expected Optimization Comparison")
         
-        if fig:
-            st.pyplot(fig)
-            st.caption("Demo visualization with simulated data")
-    
-    # === Section 4: Strategic Recommendations ===
-    st.header("Race Strategy Recommendations")
-    
-    # Get track-specific characteristics
-    track_characteristics = {
-        "Silverstone": {
-            "tire_deg": "High",
-            "overtaking": "Medium",
-            "key_sectors": "1 and 2",
-            "weather_risk": "Medium"
-        },
-        "Yas Marina": {
-            "tire_deg": "Medium",
-            "overtaking": "Low",
-            "key_sectors": "3",
-            "weather_risk": "Low"
-        }
-    }
-    
-    track_info = track_characteristics.get(TRACK_ALIASES[track], 
-                                          {"tire_deg": "Medium", "overtaking": "Medium", 
-                                           "key_sectors": "All", "weather_risk": "Medium"})
-    
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.subheader(f"Optimal Strategy for {TRACK_ALIASES[track]}")
+        # Calculate optimal pit laps under Green Flag only vs Stochastic Expected
+        best_gf_profile = stackelberg if stack_gf > nash_gf else nash
+        optimal_pit_gf = int(np.argmin(best_gf_profile))
         
-        if stackelberg_payoff > nash_payoff:
-            st.success(f"""
-            **Recommended Approach: Aggressive Stackelberg Strategy**
-            
-            Based on game theory analysis and feature importance, an aggressive approach 
-            focusing on {feature_names[most_important_feature]} during Lap-{most_important_lap} phase
-            offers the highest expected trust of {stackelberg_payoff:.3f}.
-            
-            **Key Actions:**
-            1. Push hard in early laps to establish position advantage
-            2. Optimize pit stop timing around lap {int(len(data)*0.5)}
-            3. Maximize performance in DRS zones and sector {track_info['key_sectors']}
-            """)
-        else:
-            st.info(f"""
-            **Recommended Approach: Conservative Nash Strategy**
-            
-            Based on game theory analysis and feature importance, a conservative approach 
-            focusing on {feature_names[most_important_feature]} during Lap-{most_important_lap} phase
-            offers the highest expected trust of {nash_payoff:.3f}.
-            
-            **Key Actions:**
-            1. Maintain consistent lap times to preserve tire life ({track_info['tire_deg']} degradation track)
-            2. Optimize pit stop timing around lap {int(len(data)*0.4)}
-            3. Focus on defensive positioning in sector {track_info['key_sectors']}
-            """)
-    
-    with col2:
-        st.subheader("Race-Specific Considerations")
+        best_stoch_profile = stackelberg if stackelberg_payoff > nash_payoff else nash
+        optimal_pit_stoch = int(np.argmin(best_stoch_profile))
         
         st.markdown(f"""
-        **{TRACK_ALIASES[track]} Characteristics:**
-        - **Tire Degradation:** {track_info['tire_deg']}
-        - **Overtaking Difficulty:** {track_info['overtaking']}
-        - **Key Sectors:** Sector {track_info['key_sectors']}
-        - **Weather Variability:** {track_info['weather_risk']}
-        
-        **Critical Decision Points:**
-        1. **Lap {int(len(data)*0.2)}:** Assess initial tire degradation
-        2. **Lap {int(len(data)*0.4)}:** First pit window opens
-        3. **Lap {int(len(data)*0.6)}:** Evaluate undercut/overcut opportunities
-        4. **Lap {int(len(data)*0.8)}:** Final strategy adjustments
+        *   **Base Safety Car Risk**: `{sc_probs[0]:.3f}` (Lap 1)
+        *   **Green Flag Optimal Pit Lap**: `Lap {optimal_pit_gf}` (Payoff: `{max(nash_gf, stack_gf):.3f}`)
+        *   **Stochastic Expected Optimal Pit Lap**: `Lap {optimal_pit_stoch}` (Payoff: `{max(nash_payoff, stackelberg_payoff):.3f}`)
         """)
         
-        # Weather contingencies
-        if track_info['weather_risk'] != "Low":
-            st.warning(f"""
-            **Weather Contingency:**
-            {track_info['weather_risk']} risk of changing conditions requires preparation:
-            - Monitor sector times for early signs of grip changes
-            - Prepare for potential 2-stop strategy if rain develops
-            """)
+        if optimal_pit_gf == optimal_pit_stoch:
+            st.info("No strategy shift: The optimal pit lap remains unchanged after factoring in safety car probability.")
+        else:
+            st.success(f"Stochastic shift detected! Safety car risk shifts the optimal pit stop window from Lap {optimal_pit_gf} to Lap {optimal_pit_stoch}.")
+            
+    st.markdown("---")
     
-    # === Section 5: Advanced Analysis (if enabled) ===
+    # === Section 6: Circuit Constraints ===
+    st.header("Circuit Parameters")
+    track_characteristics = {
+        "Silverstone": {"tire_deg": "High", "overtaking": "Medium", "key_sectors": "Sectors 1 & 2"},
+        "Yas Marina": {"tire_deg": "Medium", "overtaking": "Low", "key_sectors": "Sector 3"}
+    }
+    track_info = track_characteristics.get(TRACK_ALIASES[track], 
+                                          {"tire_deg": "Medium", "overtaking": "Medium", "key_sectors": "All"})
+    
+    col_rec1, col_rec2 = st.columns(2)
+    with col_rec1:
+        st.subheader(f"Track Dynamics: {TRACK_ALIASES[track]}")
+        st.markdown(f"""
+        - **Tyre Degradation Rate**: {track_info['tire_deg']}
+        - **Overtaking Difficulty**: {track_info['overtaking']}
+        - **Critical Sector Focus**: {track_info['key_sectors']}
+        """)
+    with col_rec2:
+        st.subheader("Driver-Specific Strategy")
+        if driver == "HAM":
+            st.markdown(f"""
+            *   **Profile**: Consistent tyre manager, excels in late-stint pacemaking.
+            *   **Focus**: Target late-window pit stop to maximize overcut potential in sector {track_info['key_sectors']}.
+            """)
+        elif driver == "VER":
+            st.markdown(f"""
+            *   **Profile**: Aggressive early pace, strong defensive positioning.
+            *   **Focus**: Target early-window pit stop to break the competitor's DRS gap.
+            """)
+        else:
+            st.markdown(f"""
+            *   **Profile**: Telemetry-driven standard profile.
+            *   **Focus**: Prioritize tyre temperature stabilization on out-laps.
+            """)
+        
+    # === Section 7: Advanced View ===
     if advanced_view:
-        st.header("Advanced Technical Analysis")
+        st.header("Advanced Statistical Analysis")
+        col_adv1, col_adv2 = st.columns(2)
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Trust Dynamics Comparison")
+        with col_adv1:
+            st.subheader("Differential Analysis")
+            fig_diff = go.Figure()
+            fig_diff.add_trace(go.Scatter(x=data['LapNumber'], y=nash - data['Trust'], name='Nash vs Actual', line=dict(color='#3b82f6')))
+            fig_diff.add_trace(go.Scatter(x=data['LapNumber'], y=stackelberg - data['Trust'], name='Stackelberg vs Actual', line=dict(color='#e10600')))
+            fig_diff.add_hline(y=0.0, line_dash="dash", line_color="#9ca3af")
+            fig_diff.update_layout(
+                **PLOTLY_LAYOUT,
+                title=dict(text="Strategy Delta vs Actual Telemetry", font=dict(size=14, color='#f3f4f6'))
+            )
+            fig_diff.update_xaxes(title_text="Lap Number")
+            fig_diff.update_yaxes(title_text="Trust Differential")
+            st.plotly_chart(fig_diff, use_container_width=True)
             
-            # Calculate differential metrics
-            trust_diff = pd.DataFrame({
-                'Lap': data['LapNumber'],
+        with col_adv2:
+            st.subheader("Correlation Matrix")
+            corr_df = pd.DataFrame({
                 'Actual': data['Trust'],
-                'Nash_Diff': nash - data['Trust'],
-                'Stackelberg_Diff': stackelberg - data['Trust']
-            })
-            
-            # Plot differential chart
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(trust_diff['Lap'], trust_diff['Nash_Diff'], 
-                    label='Nash vs Actual', color='blue')
-            ax.plot(trust_diff['Lap'], trust_diff['Stackelberg_Diff'], 
-                    label='Stackelberg vs Actual', color='red')
-            ax.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-            ax.set_title('Strategy Performance Differential', fontsize=14)
-            ax.set_xlabel('Lap Number')
-            ax.set_ylabel('Trust Differential')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            st.pyplot(fig)
-            
-            st.markdown("""
-            The differential chart shows where each strategy outperforms the actual race data.
-            Positive values indicate potential improvement opportunities.
-            """)
-        
-        with col2:
-            st.subheader("Statistical Analysis")
-            
-            # Basic statistics
-            stats = pd.DataFrame({
-                'Metric': ['Mean', 'Std Dev', 'Min', 'Max', 'Range', 'Median'],
-                'Actual': [
-                    data['Trust'].mean(),
-                    data['Trust'].std(),
-                    data['Trust'].min(),
-                    data['Trust'].max(),
-                    data['Trust'].max() - data['Trust'].min(),
-                    data['Trust'].median()
-                ],
-                'Nash': [
-                    np.mean(nash),
-                    np.std(nash),
-                    np.min(nash),
-                    np.max(nash),
-                    np.max(nash) - np.min(nash),
-                    np.median(nash)
-                ],
-                'Stackelberg': [
-                    np.mean(stackelberg),
-                    np.std(stackelberg),
-                    np.min(stackelberg),
-                    np.max(stackelberg),
-                    np.max(stackelberg) - np.min(stackelberg),
-                    np.median(stackelberg)
-                ]
-            }).set_index('Metric')
-            
-            st.dataframe(stats.style.format("{:.4f}").background_gradient(cmap='viridis'))
-            
-            # Calculate correlations
-            corr_data = pd.DataFrame({
-                'Actual': data['Trust'],
-                'Nash': pd.Series(nash),
-                'Stackelberg': pd.Series(stackelberg)
-            })
-            
-            st.markdown("**Strategy Correlations:**")
-            st.dataframe(corr_data.corr().style.format("{:.4f}").background_gradient(cmap='coolwarm'))
-    
-    # === Conclusion ===
-    st.header("Strategic Assessment")
-    
-    final_strategy = "Stackelberg (Aggressive)" if stackelberg_payoff > nash_payoff else "Nash (Conservative)"
-    
-    st.markdown(f"""
-    ## Summary
-    
-    For {driver} at {year} {TRACK_ALIASES[track]}, our analysis recommends a **{final_strategy}** approach
-    with focus on optimizing {feature_names[most_important_feature]} during the Lap-{most_important_lap} phase.
-    
-    **Expected performance improvement:** 
-    {max(nash_payoff, stackelberg_payoff) - data['Trust'].mean():.3f} (+{(max(nash_payoff, stackelberg_payoff)/data['Trust'].mean() - 1)*100:.1f}%)
-    
-    This analysis combines game theory optimization with machine learning insights from historical race data,
-    providing a comprehensive strategic framework for race engineers.
-    """)
+                'Nash': nash,
+                'Stackelberg': stackelberg
+            }).corr()
+            st.dataframe(corr_df.style.format("{:.4f}").background_gradient(cmap='coolwarm'))
 
 else:
-    st.error("No valid data found for selected race and driver. Please try another combination.")
+    # === Demo Mode fallbacks ===
+    st.warning("Live data unavailable or Demo Mode checked. Displaying simulated telemetry...")
     
-    # Show demo anyway for presentation purposes
-    st.warning("Displaying demo visualization for presentation purposes...")
-    
-    # Demo data for visualization
+    # Generate mock race data (50 laps)
     demo_laps = 50
-    x = np.arange(demo_laps)
+    laps_seq = np.arange(demo_laps)
+    mock_trust = np.clip(0.7 + 0.2 * np.sin(laps_seq / 8) - 0.005 * laps_seq, 0, 1)
     
-    # Simulated trust data
-    trust_actual = 0.7 + 0.2 * np.sin(x/10) - 0.01 * x
-    trust_actual = np.clip(trust_actual, 0, 1)
+    # Simulated Exit Gap: let's create a sinus gap profile varying between 0.2s and 12s
+    simulated_gap = 4.0 + 3.5 * np.cos(laps_seq / 3.0) + 2.0 * np.sin(laps_seq / 1.5)
+    simulated_gap = np.clip(simulated_gap, 0.1, 15.0)
     
-    # Simulated strategies
-    trust_nash = trust_actual * 1.05
-    trust_nash[20:25] *= 0.7  # Simulated pit stop
-    trust_nash = np.clip(trust_nash, 0, 1)
+    # Traffic density: higher when gap is low
+    simulated_density = np.where(simulated_gap < 2.0, 2, 0)
     
-    trust_stackelberg = trust_actual * 1.1
-    trust_stackelberg[:10] *= 1.05  # Aggressive start
-    trust_stackelberg[25:30] *= 0.65  # Simulated pit stop
-    trust_stackelberg = np.clip(trust_stackelberg, 0, 1)
+    mock_data = pd.DataFrame({
+        'LapNumber': laps_seq,
+        'LapTime': 90.0 - 5 * mock_trust,
+        'FuelCorrectedTime': 90.0 - 5 * mock_trust - 0.03 * 110.0 * (1.0 - laps_seq / demo_laps),
+        'Position': np.ones(demo_laps) * 2,
+        'Trust': mock_trust,
+        'ExitGap': simulated_gap,
+        'ExitGap_SC': simulated_gap + 10.0,
+        'TrafficDensity': simulated_density
+    })
     
-    # Plot demo data
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(x, trust_actual, label='Simulated Actual', color='#2c3e50', lw=2)
-    ax.plot(x, trust_nash, label='Simulated Nash', ls='--', color='#3498db', lw=1.5)
-    ax.plot(x, trust_stackelberg, label='Simulated Stackelberg', ls='-.', color='#e74c3c', lw=1.5)
-    ax.set_title("Demo: Trust Dynamics Comparison", fontsize=16, pad=15)
-    ax.set_xlabel("Lap Number", fontsize=12)
-    ax.set_ylabel("Trust Score (0-1)", fontsize=12)
-    ax.set_ylim(0, 1.1)
-    ax.grid(True, alpha=0.2)
-    ax.legend(loc='lower center', ncol=3, frameon=True)
+    strategist = GameTheoryStrategist(mock_data)
+    nash = strategist.nash_equilibrium()
+    stackelberg = strategist.stackelberg_leadership()
+    sc_probs = strategist.calculate_sc_probability(track="Silverstone")
+    nash_payoff, stackelberg_payoff = strategist.calculate_expected_payoff(nash, stackelberg, sc_probs)
     
-    st.pyplot(fig)
+    # Render interactive graphs
+    st.plotly_chart(plot_strategies(mock_data, nash, stackelberg), use_container_width=True)
+    st.plotly_chart(plot_game_theory_payoff(nash_payoff, stackelberg_payoff), use_container_width=True)
     
-    # Demo feature importance
+    # Demo heatmap
     demo_importances = np.array([
-        # Lap 0: LapTime low, Position high, Trust moderate
         0.15, 0.15, 0.9, 0.9, 0.4, 0.4,
-        # Lap 1: LapTime high, Position low, Trust moderate
         0.9, 0.9, 0.15, 0.15, 0.6, 0.6,
-        # Lap 2: LapTime low, Position high, Trust moderate
         0.15, 0.15, 0.9, 0.9, 0.6, 0.6,
-        # Lap 3: LapTime moderate, Position moderate, Trust low
         0.6, 0.6, 0.6, 0.6, 0.4, 0.4,
-        # Lap 4: LapTime moderate, Position low, Trust low
         0.6, 0.6, 0.15, 0.15, 0.4, 0.4
-    ])
-    # Trim to expected 15 values (5 laps × 3 features)
-    demo_importances = demo_importances[:15]
+    ])[:15]
     
-    st.header("Trust Factor Analysis (Demo)")
-    fig = plot_feature_importance_heatmap(demo_importances)
-    if fig:
-        st.pyplot(fig)
+    st.plotly_chart(plot_feature_importance_heatmap(demo_importances), use_container_width=True)
