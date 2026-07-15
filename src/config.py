@@ -1,6 +1,7 @@
 import os
 import yaml
 from dataclasses import dataclass
+from typing import Dict
 
 @dataclass
 class PitConfig:
@@ -60,6 +61,13 @@ class MonteCarloConfig:
     pacing_std: float
 
 @dataclass
+class TrackOverrideConfig:
+    pit_loss: float
+    degradation_scale: float
+    overtaking_index: float
+    base_sc_probability: float
+
+@dataclass
 class RaceConfig:
     pit: PitConfig
     tyre: TyreConfig
@@ -68,9 +76,9 @@ class RaceConfig:
     safety_car: SafetyCarConfig
     rl: RLConfig
     monte_carlo: MonteCarloConfig
+    tracks: Dict[str, TrackOverrideConfig]
 
 def load_config(config_path: str = "configs/race_config.yaml") -> RaceConfig:
-    # Get standard directory relative to project root
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     full_path = os.path.join(project_root, config_path)
     
@@ -93,6 +101,10 @@ def load_config(config_path: str = "configs/race_config.yaml") -> RaceConfig:
     rl = RLConfig(**data["rl"])
     monte_carlo = MonteCarloConfig(**data["monte_carlo"])
     
+    tracks_dict = {}
+    for track_name, track_data in data["tracks"].items():
+        tracks_dict[track_name] = TrackOverrideConfig(**track_data)
+        
     return RaceConfig(
         pit=pit,
         tyre=tyre,
@@ -100,7 +112,8 @@ def load_config(config_path: str = "configs/race_config.yaml") -> RaceConfig:
         traffic=traffic,
         safety_car=safety_car,
         rl=rl,
-        monte_carlo=monte_carlo
+        monte_carlo=monte_carlo,
+        tracks=tracks_dict
     )
 
 # Expose global config singleton

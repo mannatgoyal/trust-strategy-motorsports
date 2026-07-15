@@ -63,3 +63,26 @@ rl:
 monte_carlo:
   default_trials: 1000
   pacing_std: 0.15          # driver pacing inconsistency standard deviation (seconds)
+
+# Circuit-Specific Override Profiles
+tracks:
+  silverstone:
+    pit_loss: 20.5
+    degradation_scale: 1.20
+    overtaking_index: 1.50
+    base_sc_probability: 0.015
+  monaco:
+    pit_loss: 18.9
+    degradation_scale: 0.85
+    overtaking_index: 0.25
+    base_sc_probability: 0.022
+  monza:
+    pit_loss: 24.0
+    degradation_scale: 0.90
+    overtaking_index: 1.80
+    base_sc_probability: 0.012
+  bahrain:
+    pit_loss: 22.5
+    degradation_scale: 1.30
+    overtaking_index: 1.60
+    base_sc_probability: 0.014

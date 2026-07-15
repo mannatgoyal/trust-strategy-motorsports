@@ -29,8 +29,8 @@ class StrategyConfidenceEstimator:
     ) -> float:
         """
         Computes the weighted Performance Confidence score.
-        Formula:
-          Conf = 0.25*Pace + 0.20*Deg + 0.20*Pred + 0.15*Fuel + 0.20*(1 - Anomaly)
+        Formula (Equation 5.1 in README):
+          Confidence = 0.25*Pace + 0.20*Deg + 0.20*Pred + 0.15*Fuel + 0.20*(1 - Anomaly)
         """
         score = (
             0.25 * pace_consistency +

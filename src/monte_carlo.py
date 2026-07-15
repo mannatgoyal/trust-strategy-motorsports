@@ -13,6 +13,9 @@ class F1MonteCarloSimulator:
     """
     State-of-the-art Monte Carlo simulator coordinating all thermodynamic tyre wear, 
     fuel timing, Bayesian Safety Cars, dynamic weather, and traffic wake bottlenecks.
+    
+    Joint Probability Sampling:
+      Weather Dampness -> Driver Pacing Volatility & Overtaking Incidents -> Safety Car Posteriors.
     """
     def __init__(self, data: pd.DataFrame):
         self.data = data.copy()
@@ -21,11 +24,8 @@ class F1MonteCarloSimulator:
         
     def simulate_trial(self, strategy: np.ndarray, sc_probs: np.ndarray) -> Tuple[float, int]:
         """
-        Simulates a single stint timeline, sampling all random elements.
-        Returns:
-            (total_stint_time, finishing_position)
+        Simulates a single stint timeline, sampling all random elements jointly.
         """
-        # 1. Instantiate modules
         tyre_model = TireDegradationModel(compound='medium')
         fuel_model = FuelModel(total_laps=self.laps)
         pit_model = PitStopSimulator()
@@ -40,67 +40,79 @@ class F1MonteCarloSimulator:
         for k in range(self.laps):
             push_level = float(strategy[k])
             
-            # A. Dynamic Weather update
+            # A. Joint Weather state update
             dampness, weather_state = weather_model.step_lap(k)
             wear_mult = weather_model.get_tyre_wear_multiplier(tyre_model.compound, weather_state)
             grip_mult = weather_model.get_track_grip_multiplier(tyre_model.compound, weather_state)
             
-            # B. Bayesian Safety Car estimation & draw
-            recent_incidents = 1 if np.random.random() < 0.02 else 0
+            # B. Correlated parameters: rain increases driver volatility & crash incidents
+            if weather_state == 'Wet':
+                pacing_std = CONFIG.monte_carlo.pacing_std * 2.0
+                incident_prob = 0.08
+            elif weather_state == 'Damp':
+                pacing_std = CONFIG.monte_carlo.pacing_std * 1.4
+                incident_prob = 0.04
+            else:
+                pacing_std = CONFIG.monte_carlo.pacing_std
+                incident_prob = 0.015
+                
+            recent_incidents = 1 if np.random.random() < incident_prob else 0
+            
+            # C. Bayesian Safety Car drawing (posterior updates dynamic incidents)
             sc_est = sc_model.estimate_posterior_probabilities(k+1, "Silverstone", weather_state, recent_incidents)
             sc_active = np.random.random() < sc_est['Combined']
             
-            # C. Pacing consistency noise (driver error volatility)
-            pacing_error = np.random.normal(0.0, CONFIG.monte_carlo.pacing_std)
+            # Pacing consistency noise (driver error volatility)
+            pacing_error = np.random.normal(0.0, pacing_std)
             
             if k == pit_lap:
-                # Pit Stop Execution
+                # Pit Stop Simulation
                 stop_results = pit_model.simulate_stop(track_name="Silverstone")
-                # Adjust time for safety car speed reductions
                 pit_time = stop_results['total_loss']
                 if sc_active:
-                    pit_time -= 10.0 # Pit stop costs 10 seconds less under safety car
+                    # Pit timing benefit under safety car (slower delta loss)
+                    pit_time -= 10.0
                 elapsed_time += pit_time + stop_results['cold_tire_penalty']
                 
-                # Check exit release gap traffic penalty
+                # Traffic wake exit gap evaluation
                 col_gap = 'ExitGap_SC' if sc_active else 'ExitGap'
                 exit_gap = self.data.loc[k, col_gap] if col_gap in self.data.columns else 4.0
                 traffic_loss = traffic_model.estimate_traffic_time_loss(
                     exit_gap=exit_gap,
-                    grip_self=0.9, # new tyre grip
-                    grip_ahead=0.7, # competitor worn tyre grip
+                    grip_self=0.9,
+                    grip_ahead=0.7,
                     drs_zone=(k % 5 == 0),
                     closing_speed=0.5
                 )
                 elapsed_time += traffic_loss
                 tyre_model.reset()
             else:
-                # Standard running lap
+                # Standard pacing lap
                 wear, temp, grip = tyre_model.step_lap(push_level, 35.0, 25.0)
                 grip = grip * grip_mult
                 
-                # Apply thermodynamic wear pacing penalty
+                # Wear and temperature pacing penalties
                 wear_loss = tyre_model.calculate_lap_penalty(grip) * wear_mult
                 
-                # Apply non-linear fuel weight penalty
+                # Fuel timing corrections
                 fuel_mass = fuel_model.step_lap(push_level)
                 fuel_loss = fuel_model.calculate_lap_time_effect(fuel_mass)
                 
-                # Dynamic dirty air loss
+                # Aerodynamic wake penalty
                 gap_ahead = self.data.loc[k, 'GapAhead'] if 'GapAhead' in self.data.columns else 5.0
                 dirty_air_loss = traffic_model.calculate_dirty_air_penalty(gap_ahead, drs_active=(gap_ahead < 1.0))
                 
                 lap_time = 90.0 - 5.0 * self.base_trust[k] + wear_loss + fuel_loss + dirty_air_loss + pacing_error
                 
-                # Safety car track speed restrictions
+                # Safety car track speeds
                 if sc_active:
                     lap_time += np.random.uniform(15.0, 25.0)
-                
-                # Overtaking simulator updates position
+                    
+                # Sigmoidal overtaking updates position
                 if gap_ahead < 1.0:
                     p_overtake = traffic_model.calculate_overtake_probability(
                         grip_self=grip,
-                        grip_ahead=0.75, # competitor reference grip
+                        grip_ahead=0.75,
                         gap=gap_ahead,
                         drs_zone=(k % 5 == 0),
                         closing_speed=0.2
@@ -115,8 +127,6 @@ class F1MonteCarloSimulator:
     def run_simulation(self, strategy: np.ndarray, sc_probs: np.ndarray, trials: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
         """
         Runs M Monte Carlo stint trials.
-        Returns:
-            (stint_times, final_positions)
         """
         times = np.zeros(trials)
         positions = np.zeros(trials, dtype=int)

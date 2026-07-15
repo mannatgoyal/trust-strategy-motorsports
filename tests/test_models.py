@@ -10,6 +10,7 @@ from src.trust_analysis import StrategyConfidenceEstimator
 from src.differential_games import F1TrajectoryOptimizer
 from src.reinforcement_learning import F1Environment, QLearningAgent, train_agent
 from src.monte_carlo import F1MonteCarloSimulator
+from src.race_replay import F1RaceReplay
 
 class TestF1ModelsExpanded(unittest.TestCase):
     
@@ -93,7 +94,7 @@ class TestF1ModelsExpanded(unittest.TestCase):
         env = F1Environment(self.mock_data)
         state = env.reset()
         # Correct discrete features layout
-        self.assertEqual(len(state), 6)
+        self.assertEqual(len(state), 9)
         
         next_state, reward, done = env.step(action=4) # Attack action
         self.assertEqual(env.current_lap, 1)
@@ -111,6 +112,15 @@ class TestF1ModelsExpanded(unittest.TestCase):
         self.assertIn('std_dev', metrics)
         self.assertIn('ci_95', metrics)
         self.assertGreater(metrics['std_dev'], 0.0)
+
+    def test_race_replay_timeline(self):
+        replay = F1RaceReplay(self.mock_data, track_name="Silverstone")
+        results = replay.execute_replay()
+        
+        self.assertEqual(len(results), self.laps_count)
+        self.assertIn('StrategyConfidence', results.columns)
+        self.assertIn('SafetyCarThreat', results.columns)
+        self.assertIn('AIRecommendedAction', results.columns)
 
 if __name__ == '__main__':
     unittest.main()

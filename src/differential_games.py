@@ -5,9 +5,37 @@ from src.config import CONFIG
 
 class F1TrajectoryOptimizer:
     """
-    Continuous vehicle pacing and ERS energy optimization.
-    Solves stint trajectories using non-linear tire grip, braking recovery, 
-    energy constraints, and heat wear curves.
+    Continuous vehicle pacing and ERS energy optimization solver.
+    
+    Mathematical Formulation (Differential Game & Optimal Control):
+    ===============================================================
+    1. State Vector (S):
+       - h(t): Tire health, h in [0, 1].
+       - E(t): Battery State of Charge (SoC) in MJ, E in [0, 4.0].
+       - T(t): Tire surface temperature in °C, T in [35, 140].
+       
+    2. Control Vector (U):
+       - u(t): Throttle push level, u in [0.85, 1.15].
+       - b(t): ERS Boost energy deployment, b in [0, 1].
+       - d(t): Braking regeneration force, d in [0, 1].
+       
+    3. State Transition Differential Equations:
+       - Tire degradation rate:
+         dh/dt = -f_h(u, b, T) = -0.008 * u^2 * (1.0 + 0.02 * max(0, T - 110)) - 0.003 * b
+       - Battery SoC recovery/depletion rate:
+         dE/dt = f_E(d, b) = 0.8 * eta * d - 1.2 * b
+       - Tire thermodynamic temperature rate:
+         dT/dt = f_T(u, grip) - cooling = 12.0 * u^2 * grip - 6.0 * (T - 25.0)
+         
+    4. Cost Functional (J) to Minimize (Total Stint Time):
+       J = Inegral_0^T_f [ LapTime_k(u_k, b_k, d_k, h_k, E_k, T_k) ] dt
+       
+    5. Hamiltonian Definition (H):
+       H(S, U, lambda) = LapTime(u, b, d, h, E, T) + lambda_h * dh/dt + lambda_E * dE/dt + lambda_T * dT/dt
+       
+    6. Numerical Optimization Strategy:
+       To maintain computational efficiency under live stream constraints, the continuous Hamiltonian 
+       is discretized over the stint timeline and solved using Sequential Least Squares Programming (SLSQP).
     """
     def __init__(self, base_trust: np.ndarray, regen_efficiency: float = 0.8, min_tire_health: float = 0.15):
         self.base_trust = np.array(base_trust)
@@ -18,12 +46,6 @@ class F1TrajectoryOptimizer:
     def simulate_stint(self, u: np.ndarray, b: np.ndarray, d: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Simulates vehicle states over the stint.
-        Controls:
-            u: Throttle push [0.85, 1.15]
-            b: ERS Boost deployment [0.0, 1.0]
-            d: Braking recovery force [0.0, 1.0]
-        Returns:
-            (tire_health, battery_energy, lap_times, tire_temps)
         """
         N = self.laps
         h = np.zeros(N)
@@ -84,7 +106,6 @@ class F1TrajectoryOptimizer:
         Variables: x = [u (laps), b (laps), d (laps)] -> total 3*N variables.
         """
         N = self.laps
-        # Initial guess: moderate push (1.0), zero boost (0.1), moderate braking (0.5)
         x0 = np.concatenate([np.ones(N), np.full(N, 0.1), np.full(N, 0.5)])
         
         # Variable boundaries

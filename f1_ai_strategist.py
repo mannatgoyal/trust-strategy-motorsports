@@ -18,11 +18,11 @@ from src.game_theory import GameTheoryStrategist
 from src.differential_games import F1TrajectoryOptimizer
 from src.reinforcement_learning import F1Environment, QLearningAgent, train_agent
 from src.monte_carlo import F1MonteCarloSimulator
+from src.race_replay import F1RaceReplay
 
 # ========== Streamlit Configuration & Styling ==========
 st.set_page_config(page_title="F1 Strategy Engineer Toolkit", layout="wide")
 
-# Applying high-contrast modern typography, dark theme, and grid card layouts
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
@@ -60,7 +60,7 @@ h1, h2, h3, h4, h5, h6 {
 """, unsafe_allow_html=True)
 
 st.title("F1 Strategy Engineer Toolkit")
-st.caption("SOLID Game Theory, Thermodynamic Degradation & Machine Learning System - v7.0 | July 2026")
+st.caption("SOLID Game Theory, Thermodynamic Degradation & Machine Learning System - v7.1 | July 2026")
 
 # ========== Global Plot Styling Config (No Gradients) ==========
 PLOTLY_LAYOUT = dict(
@@ -92,45 +92,39 @@ with st.sidebar:
     driver = st.selectbox("Driver", ["HAM", "VER"])
     
     st.markdown("---")
-    st.subheader("Configure Tyre compounds")
+    st.subheader("Configure Track Profile")
+    
+    track_alias_key = "silverstone" if "British" in track else "yas_marina"
+    track_cfg = CONFIG.tracks.get(track_alias_key)
+    
+    st.markdown(f"**Loaded Profile**: `{track_alias_key.upper()}`")
+    pit_loss_val = st.number_input("Pit Lane Loss (seconds)", 10.0, 30.0, float(track_cfg.pit_loss))
+    deg_scale_val = st.slider("Tire Degradation Scale", 0.5, 2.0, float(track_cfg.degradation_scale))
+    overtake_index_val = st.slider("Overtaking Index", 0.1, 2.5, float(track_cfg.overtaking_index))
+    
+    # Override CONFIG values dynamically
+    track_cfg.pit_loss = pit_loss_val
+    track_cfg.degradation_scale = deg_scale_val
+    track_cfg.overtaking_index = overtake_index_val
+    
+    st.markdown("---")
+    st.subheader("Tyre Grip Overrides")
     c_soft_grip = st.slider("Soft Grip Coefficient", 0.90, 1.20, CONFIG.tyre.soft.base_grip)
     c_med_grip = st.slider("Medium Grip Coefficient", 0.85, 1.15, CONFIG.tyre.medium.base_grip)
     c_hard_grip = st.slider("Hard Grip Coefficient", 0.80, 1.10, CONFIG.tyre.hard.base_grip)
     
     st.markdown("---")
-    st.subheader("Non-linear Fuel burn parameters")
-    fuel_lin = st.number_input("Linear timing cost (s/kg)", 0.01, 0.08, CONFIG.fuel.fuel_penalty_linear)
-    fuel_quad = st.number_input("Quadratic timing decay", 1e-6, 1e-4, CONFIG.fuel.fuel_penalty_quadratic, format="%.5f")
-    
-    st.markdown("---")
-    st.subheader("Overtaking & Traffic Wake")
-    traffic_threshold = st.slider("Dirty air wake window (s)", 0.5, 3.0, CONFIG.traffic.dirty_air_threshold)
-    defensive_skill = st.slider("Competitor defense index", 0.5, 3.0, CONFIG.traffic.base_defensive_factor)
-    
-    st.markdown("---")
-    st.subheader("Bayesian Safety Car Priors")
-    sc_prior_val = st.number_input("Prior SC Probability per lap", 0.001, 0.100, CONFIG.safety_car.sc_prior, format="%.3f")
-    rain_risk_mult = st.slider("SC multiplier under rain", 1.0, 5.0, CONFIG.safety_car.rain_multiplier)
-    
-    st.markdown("---")
-    st.subheader("Strategic Solvers")
-    rl_episodes = st.slider("RL training episodes", 100, 2500, CONFIG.rl.epsilon_initial * 5000, step=100)
-    mc_trials = st.selectbox("Monte Carlo trials", [100, 1000, 5000], index=1)
+    st.subheader("Strategic Tuning")
+    rl_episodes = st.slider("RL training episodes", 100, 2000, 500, step=100)
+    mc_trials = st.selectbox("Monte Carlo trials", [100, 500, 1000], index=1)
 
-# Apply configurations overrides
 CONFIG.tyre.soft.base_grip = c_soft_grip
 CONFIG.tyre.medium.base_grip = c_med_grip
 CONFIG.tyre.hard.base_grip = c_hard_grip
-CONFIG.fuel.fuel_penalty_linear = fuel_lin
-CONFIG.fuel.fuel_penalty_quadratic = fuel_quad
-CONFIG.traffic.dirty_air_threshold = traffic_threshold
-CONFIG.traffic.base_defensive_factor = defensive_skill
-CONFIG.safety_car.sc_prior = sc_prior_val
-CONFIG.safety_car.rain_multiplier = rain_risk_mult
 
 # ========== Telemetry pipeline Ingestion ==========
 pipeline = F1TelemetryPipeline(year, track, driver)
-with st.spinner("Ingesting sector times and ERS telemetry traces..."):
+with st.spinner("Ingesting timing sector parameters and telemetry logs..."):
     data = pipeline.load_and_preprocess()
 
 if not data.empty:
@@ -141,29 +135,25 @@ if not data.empty:
     corrected_times = []
     fuel_masses = []
     
-    # Simulate fuel timeline
     curr_fuel = CONFIG.fuel.fuel_capacity
     for idx, row in data.iterrows():
-        # Timing penalty is subtracted to yield empty-weight timing potential
         fuel_loss = fuel_model.calculate_lap_time_effect(curr_fuel)
         corrected_times.append(row['LapTime'] - fuel_loss)
         fuel_masses.append(curr_fuel)
-        # Burn fuel for this lap (push = 1.0 baseline)
         curr_fuel = max(0.0, curr_fuel - fuel_model.calculate_lap_burn(push_level=1.0))
         
     data['FuelCorrectedTime'] = corrected_times
     data['RemainingFuel'] = fuel_masses
     
-    # Evaluate Performance/Strategy Confidence
+    # Evaluate Performance Confidence
     estimator = StrategyConfidenceEstimator()
     confidence_values = []
     
     q_median = data['FuelCorrectedTime'].median()
     for idx, row in data.iterrows():
-        # Components
         pace_cons = 1.0 - min(1.0, abs(row['FuelCorrectedTime'] - q_median) / q_median)
         wear_stability = 1.0 - (row['TyreAge'] * 0.005)
-        pred_cert = 0.95 - (idx * 0.002) # confidence decays as window offset grows
+        pred_cert = 0.95 - (idx * 0.002)
         fuel_cons = 0.98
         anomaly = 0.05 if abs(row['FuelCorrectedTime'] - q_median) < 2.0 else 0.40
         
@@ -174,13 +164,10 @@ if not data.empty:
     
     # Setup Solvers
     strategist = GameTheoryStrategist(data)
-    nash = strategist.solve_mixed_nash
     sc_probs = strategist.calculate_sc_probability(track)
     
-    # Standard Pacing vectors
     strat_conservative = np.full(len(data), 0.90)
     strat_aggressive = np.full(len(data), 1.10)
-    # Target pit lap is minimum index
     strat_conservative[int(len(data)*0.55)] = 0.10
     strat_aggressive[int(len(data)*0.40)] = 0.10
     
@@ -190,13 +177,13 @@ if not data.empty:
         st.metric(
             label="Mean Strategy Confidence",
             value=f"{data['StrategyConfidence'].mean():.3%}",
-            help="Weighted stint pace, thermodynamic tyre wear, and fuel reliability score."
+            help="Weighted performance consistency and model reliability score."
         )
     with col_m2:
         st.metric(
-            label="Max Stint Speed",
-            value=f"{data['TopSpeed'].max():.1f} km/h",
-            help="Peak telemetry speed record across the entire stint duration."
+            label="Track Degradation Scale",
+            value=f"{track_cfg.degradation_scale:.2f}x",
+            help="Tire wear rate modifier based on track layout."
         )
     with col_m3:
         st.metric(
@@ -353,7 +340,7 @@ if not data.empty:
         *   **Opening lap risk spike multiplier**: `3.0x`
         *   **Wet weather multiplier**: `{CONFIG.safety_car.rain_multiplier}x`
         """)
-        st.info("Bayesian probabilities peak at the opening lap and spike during wet weather transitions (simulated damp stint laps).")
+        st.info("Bayesian probabilities peak at the opening lap and spike during wet weather transitions.")
 
     st.markdown("---")
     
@@ -417,7 +404,8 @@ if not data.empty:
         for lap_val, lap_name in [(0, "Early stint"), (2, "Late stint")]:
             for wear_val, wear_name in [(0, "Fresh"), (2, "Critical")]:
                 for fuel_val, fuel_name in [(0, "Light fuel"), (1, "Heavy fuel")]:
-                    state = (lap_val, wear_val, fuel_val, 0, 0, 0)
+                    # State format: (lap, wear, temp, fuel, gap, weather, drs, sc, ers)
+                    state = (lap_val, wear_val, 1, fuel_val, 0, 0, 0, 0, 1)
                     best_action = np.argmax([rl_agent.get_q_value(state, a) for a in range(5)])
                     states_list.append(f"{lap_name} | {wear_name} | {fuel_name}")
                     policies_list.append(action_names[best_action])
@@ -473,6 +461,66 @@ if not data.empty:
             ]
         }).set_index('Risk Metric')
         st.dataframe(outcomes_df)
+
+    st.markdown("---")
+
+    # === Chapter 8: Real Race Replay & Strategy Audit ===
+    st.header("Chapter 8: Live Race Replay & Strategy Audit")
+    st.markdown("""
+    This section replays the historical stint telemetry lap-by-lap, using our thermodynamic wear models, 
+    Bayesian SC estimators, and Strategy Confidence networks. It audits the actual team pit decisions 
+    against the AI's recommendations.
+    """)
+    
+    replay_engine = F1RaceReplay(data, track)
+    replay_df = replay_engine.execute_replay()
+    
+    col_c8_1, col_c8_2 = st.columns([2, 1])
+    with col_c8_1:
+        # Plot Confidence timeline with Pit Actions highlighted as scatter dots
+        fig_replay = go.Figure()
+        fig_replay.add_trace(go.Scatter(x=replay_df['Lap'], y=replay_df['StrategyConfidence'], name="AI Strategy Confidence", line=dict(color='#3b82f6', width=3)))
+        fig_replay.add_trace(go.Scatter(x=replay_df['Lap'], y=replay_df['SafetyCarThreat'], name="SC Threat Level", line=dict(color='#eab308', width=2, dash='dash')))
+        
+        # Highlight Actual Team Pit Stop
+        actual_pits = replay_df[replay_df['ActualAction'] == 'Pit Stop']
+        fig_replay.add_trace(go.Scatter(
+            x=actual_pits['Lap'], y=actual_pits['StrategyConfidence'],
+            mode='markers', name="Actual Pit Stop",
+            marker=dict(color='#e10600', size=12, symbol='star')
+        ))
+        
+        # Highlight AI recommended Pit Stop
+        ai_pits = replay_df[replay_df['AIRecommendedAction'] == 'Pit Stop']
+        fig_replay.add_trace(go.Scatter(
+            x=ai_pits['Lap'], y=ai_pits['StrategyConfidence'],
+            mode='markers', name="AI Recommended Pit",
+            marker=dict(color='#10b981', size=10, symbol='circle-open', line=dict(width=2))
+        ))
+        
+        fig_replay.update_layout(**PLOTLY_LAYOUT, title="Race Replay Pacing & Pit Stop Chronology")
+        st.plotly_chart(fig_replay, use_container_width=True)
+    with col_c8_2:
+        st.subheader("Strategy Audit Report")
+        
+        # Overtakes, pit stop timing mismatch, alignment index
+        alignment_score = 1.0 - (replay_df['StrategyDeviation'].mean())
+        pit_laps_act = list(replay_df[replay_df['ActualAction'] == 'Pit Stop']['Lap'])
+        pit_laps_ai = list(replay_df[replay_df['AIRecommendedAction'] == 'Pit Stop']['Lap'])
+        
+        st.markdown(f"""
+        *   **Actual Pit Stops executed**: `Laps {pit_laps_act}`
+        *   **AI Recommended Pit Stop windows**: `Laps {pit_laps_ai}`
+        *   **AI vs Team Strategy Alignment Score**: `{alignment_score:.2%}`
+        """)
+        
+        if len(pit_laps_act) > 0 and len(pit_laps_ai) > 0:
+            delay = abs(pit_laps_act[0] - pit_laps_ai[0])
+            st.metric(label="Pit Decision Interval Mismatch", value=f"{delay} laps")
+        else:
+            st.metric(label="Pit Decision Interval Mismatch", value="0 laps")
+            
+        st.info("The alignment score measures how closely the team's live tactical choices matched the thermodynamic tyre and safety car risk suggestions generated by the strategist.")
 
 else:
     st.error("No telemetry data loaded. Ensure the session selection has valid telemetry.")
