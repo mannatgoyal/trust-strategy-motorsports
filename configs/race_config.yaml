@@ -1,0 +1,65 @@
+# F1 Strategy Engineer System Configuration
+
+# Track Physics parameters
+pit:
+  pit_entry_loss: 5.0       # entry transit loss (seconds)
+  pit_exit_loss: 4.5        # exit transit loss (seconds)
+  stationary_mean: 2.5      # target pit stop wheel gun time (seconds)
+  stationary_std: 0.35      # pit stop execution variance (seconds)
+  cold_tire_outlap_loss: 1.5 # cold tire out-lap pace penalty (seconds)
+
+# Tyre compounds (Soft, Medium, Hard)
+tyre:
+  soft:
+    base_grip: 1.05
+    wear_rate: 0.035
+    thermal_window_min: 90.0
+    thermal_window_max: 110.0
+    cliff_wear: 0.70
+  medium:
+    base_grip: 1.00
+    wear_rate: 0.015
+    thermal_window_min: 85.0
+    thermal_window_max: 115.0
+    cliff_wear: 0.80
+  hard:
+    base_grip: 0.94
+    wear_rate: 0.007
+    thermal_window_min: 80.0
+    thermal_window_max: 120.0
+    cliff_wear: 0.90
+  friction_heat: 15.0        # friction heat factor
+  cooling_rate: 8.0          # cooling rate factor
+
+# Non-linear Fuel model parameters
+fuel:
+  fuel_capacity: 110.0      # kg
+  fuel_penalty_linear: 0.028 # seconds per kg linear timing penalty
+  fuel_penalty_quadratic: 0.00004 # quadratic decay factor
+  aero_sensitivity: 0.002   # aero efficiency scaling
+
+# Overtaking and wake parameters
+traffic:
+  dirty_air_threshold: 1.5  # wake distance boundary (seconds)
+  dirty_air_loss_max: 1.5   # peak time loss in clean wake (seconds)
+  sigmoid_overtake_scale: 2.0 # sigmoidal overtaking probability scaling
+  base_defensive_factor: 1.2 # driver defensive capability index
+
+# Bayesian Safety Car Estimation
+safety_car:
+  vsc_prior: 0.008          # baseline VSC lap prior
+  sc_prior: 0.012           # baseline SC lap prior
+  red_flag_prior: 0.002     # baseline Red Flag prior
+  rain_multiplier: 2.5      # risk scaling factor under wet weather
+
+# Reinforcement Learning pacing parameters
+rl:
+  learning_rate: 0.1
+  discount_factor: 0.95
+  epsilon_initial: 0.20
+  epsilon_decay: 0.995
+
+# Monte Carlo simulation configuration
+monte_carlo:
+  default_trials: 1000
+  pacing_std: 0.15          # driver pacing inconsistency standard deviation (seconds)

@@ -1,78 +1,136 @@
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score
+from typing import Dict, Tuple, Any
 
-class TrustAnalyzer:
+class StrategyConfidenceEstimator:
     """
-    Random Forest Regressor to analyze trust dynamics and feature importance.
-    Uses windowed historical lap times, track positions, and trust scores.
+    Performance and Strategy Confidence Estimator.
+    Combines pace consistency, degradation stability, prediction uncertainty,
+    fuel consistency, and anomaly metrics to estimate overall strategy confidence.
     """
-    
-    def __init__(self, n_estimators=100, random_state=42):
-        self.model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state)
-        self.scaler = StandardScaler()
-        self.feature_names = ['LapTime', 'Position', 'Trust']
-        self.test_score = 0.0  # R-squared score on test set
+    def __init__(self):
         self.is_trained = False
-        
-    def create_features(self, data, window=5):
+        self.rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+        self.gbm_model = GradientBoostingRegressor(n_estimators=100, random_state=42)
+        self.test_score_rf = 0.0
+        self.test_score_gbm = 0.0
+        self.metrics = {}
+
+    def calculate_confidence(
+        self,
+        pace_consistency: float,
+        degradation_stability: float,
+        prediction_certainty: float,
+        fuel_consistency: float,
+        anomaly_score: float
+    ) -> float:
         """
-        Creates rolling windowed features from the F1 dataset.
-        For window=5, creates a feature vector of length 15 (5 laps * 3 features).
+        Computes the weighted Performance Confidence score.
+        Formula:
+          Conf = 0.25*Pace + 0.20*Deg + 0.20*Pred + 0.15*Fuel + 0.20*(1 - Anomaly)
         """
-        X, y = [], []
-        
-        if len(data) <= window:
-            return np.array([]), np.array([])
-            
-        for i in range(window, len(data)):
-            features = []
-            for w in range(window):
-                for col in self.feature_names:
-                    features.append(data.iloc[i-window+w][col])
-            X.append(features)
-            y.append(data.iloc[i]['Trust'])
-            
-        return np.array(X), np.array(y)
-    
-    def train(self, X, y):
-        """
-        Trains the model using a train/test split.
-        Saves the performance metrics and fits on the full dataset afterwards.
-        """
-        if len(X) <= 5:
-            self.test_score = 0.0
-            return
-            
-        # 1. Train-test split (80% training, 20% validation)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.20, random_state=42
+        score = (
+            0.25 * pace_consistency +
+            0.20 * degradation_stability +
+            0.20 * prediction_certainty +
+            0.15 * fuel_consistency +
+            0.20 * (1.0 - anomaly_score)
         )
+        return float(np.clip(score, 0.0, 1.0))
+
+    def create_features(self, data: pd.DataFrame, window: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Builds feature matrices from telemetry parameters.
+        Includes Sector splits, speeds, tyre compound indicators, gaps, and ERS telemetry.
+        """
+        df = data.copy()
         
-        # 2. Fit and scale features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        self.model.fit(X_train_scaled, y_train)
+        # Categorise Tyre Compounds (one-hot encoding)
+        df['IsSoft'] = df['TyreCompound'].apply(lambda x: 1.0 if str(x).lower() == 'soft' else 0.0)
+        df['IsHard'] = df['TyreCompound'].apply(lambda x: 1.0 if str(x).lower() == 'hard' else 0.0)
         
-        # 3. Evaluate model accuracy on unseen validation data
-        if len(X_test) > 0:
-            X_test_scaled = self.scaler.transform(X_test)
-            predictions = self.model.predict(X_test_scaled)
-            self.test_score = r2_score(y_test, predictions)
-        else:
-            self.test_score = 0.0
+        # Calculate Rolling degradation slope
+        df['PaceSlope'] = df['LapTime'].diff().rolling(window=3).mean().fillna(0.0)
+        
+        # Expanded feature set
+        feature_cols = [
+            'Sector1', 'Sector2', 'Sector3',
+            'TopSpeed', 'AvgSpeed',
+            'Throttle', 'Brake', 'Steering',
+            'RPM', 'DRS', 'TyreAge',
+            'TrackTemp', 'AmbientTemp', 'RainProbability',
+            'GapAhead', 'GapBehind', 'Position',
+            'IsSoft', 'IsHard', 'PaceSlope'
+        ]
+        
+        # Make sure columns exist
+        available_cols = [c for c in feature_cols if c in df.columns]
+        
+        X_list = []
+        y_list = []
+        
+        # Build sliding windows
+        for i in range(window, len(df)):
+            window_data = df.iloc[i-window:i][available_cols].values.flatten()
+            target = df.iloc[i]['LapTime']
             
-        # 4. Refit on entire dataset for final model inference/feature importances
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
+            X_list.append(window_data)
+            y_list.append(target)
+            
+        return np.array(X_list), np.array(y_list)
+
+    def train_and_evaluate(self, X: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+        """
+        Trains and compares Random Forest and Gradient Boosting Regressors.
+        Reports validation MAE, RMSE, and R2 coefficients.
+        """
+        if len(X) < 10:
+            return {'status': 'Insufficient data'}
+            
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # 1. Random Forest training
+        self.rf_model.fit(X_train, y_train)
+        y_pred_rf = self.rf_model.predict(X_test)
+        
+        mae_rf = mean_absolute_error(y_test, y_pred_rf)
+        rmse_rf = root_mean_squared_error(y_test, y_pred_rf)
+        r2_rf = r2_score(y_test, y_pred_rf)
+        cv_scores_rf = cross_val_score(self.rf_model, X, y, cv=3)
+        
+        # 2. Gradient Boosting training
+        self.gbm_model.fit(X_train, y_train)
+        y_pred_gbm = self.gbm_model.predict(X_test)
+        
+        mae_gbm = mean_absolute_error(y_test, y_pred_gbm)
+        rmse_gbm = root_mean_squared_error(y_test, y_pred_gbm)
+        r2_gbm = r2_score(y_test, y_pred_gbm)
+        cv_scores_gbm = cross_val_score(self.gbm_model, X, y, cv=3)
+        
         self.is_trained = True
-            
-    def feature_importance(self):
+        self.metrics = {
+            'RF': {
+                'MAE': mae_rf,
+                'RMSE': rmse_rf,
+                'R2': r2_rf,
+                'CV_Mean': cv_scores_rf.mean()
+            },
+            'GBM': {
+                'MAE': mae_gbm,
+                'RMSE': rmse_gbm,
+                'R2': r2_gbm,
+                'CV_Mean': cv_scores_gbm.mean()
+            }
+        }
+        return self.metrics
+
+    def get_feature_importances(self, feature_names: list) -> np.ndarray:
         """
-        Retrieves feature importance weights if the model is trained.
+        Returns feature importances from the trained Random Forest model.
         """
-        if self.is_trained and hasattr(self.model, 'feature_importances_'):
-            return self.model.feature_importances_
-        return None
+        if not self.is_trained:
+            return np.zeros(len(feature_names))
+        return self.rf_model.feature_importances_
