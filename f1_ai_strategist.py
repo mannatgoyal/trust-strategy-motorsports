@@ -9,6 +9,7 @@ import plotly.express as px
 from src.game_theory import GameTheoryStrategist
 from src.trust_analysis import TrustAnalyzer
 from src.differential_games import F1TrajectoryOptimizer
+from src.reinforcement_learning import F1Environment, QLearningAgent, train_agent
 
 # ========== Configuration ==========
 AVAILABLE_RACES = [
@@ -361,6 +362,24 @@ def plot_state_variables(laps_seq, h, E):
     fig.update_yaxes(title_text="State Quantities")
     return fig
 
+def plot_rl_convergence(rolling_rewards):
+    """Plot reinforcement learning agent mean reward convergence curve"""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        y=rolling_rewards,
+        name="Rolling Mean Reward",
+        line=dict(color='#e10600', width=2),
+        mode='lines',
+        hovertemplate='Episode %{x}<br>Reward: %{y:.2f}<extra></extra>'
+    ))
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Q-Learning Agent Convergence Profile", font=dict(size=16, color='#f3f4f6'))
+    )
+    fig.update_xaxes(title_text="Training Episode")
+    fig.update_yaxes(title_text="Mean Episode Reward")
+    return fig
+
 # ========== Streamlit Interface & Custom Styles ==========
 st.set_page_config(page_title="F1 Strategy Engineer Toolkit", layout="wide")
 
@@ -402,7 +421,7 @@ h1, h2, h3, h4, h5, h6 {
 """, unsafe_allow_html=True)
 
 st.title("F1 Strategy Engineer Toolkit")
-st.caption("Game Theory & Machine Learning System - v4.0 | July 2026")
+st.caption("Game Theory & Machine Learning System - v5.0 | July 2026")
 
 # === Controls ===
 with st.sidebar:
@@ -428,6 +447,13 @@ with st.sidebar:
                           help="Amount of battery energy recovered during lift-and-coast per lap.")
     min_tire_target = st.slider("Min Stint Tyre Limit", min_value=0.05, max_value=0.50, value=0.15, step=0.05,
                                 help="Target structural tire health threshold remaining at stint end.")
+    
+    st.markdown("---")
+    st.subheader("Reinforcement Learning Agent Tuning")
+    rl_episodes = st.slider("Training Episodes", min_value=100, max_value=2500, value=1000, step=100,
+                            help="Total number of simulated training trials for the Q-learning agent.")
+    rl_epsilon = st.slider("Exploration Rate (Epsilon)", min_value=0.05, max_value=0.50, value=0.15, step=0.05,
+                           help="Initial rate of random search selections decaying dynamically over training.")
 
 # Load Race Data
 data = load_race_data(year, track, driver)
@@ -716,7 +742,59 @@ if not data.empty and not show_demo:
     
     st.markdown("---")
     
-    # === Section 7: Circuit Constraints ===
+    # === Chapter 7: Reinforcement Learning Strategy Agent ===
+    st.header("Chapter 7: Reinforcement Learning Strategy Agent")
+    st.markdown("""
+    Instead of static pay-off matrices or numerical solvers, we can train a **Reinforcement Learning Agent** using Tabular Q-Learning. 
+    The agent acts in a simulated race environment where it receives rewards for raw pace and tire preservation, and penalties 
+    for tire wear, blowouts, and pitting in dirty air.
+    
+    Over many training episodes, the agent updates its Q-table via the temporal difference Bellman update formula to learn 
+    the optimal policy.
+    """)
+    
+    # Setup and train agent
+    env = F1Environment(data)
+    agent = QLearningAgent(lr=0.1, discount=0.95, epsilon=rl_epsilon)
+    with st.spinner("Training Reinforcement Learning Agent..."):
+        rewards, rolling_rewards = train_agent(env, agent, episodes=rl_episodes)
+        
+    col_rl1, col_rl2 = st.columns([2, 1])
+    with col_rl1:
+        st.plotly_chart(plot_rl_convergence(rolling_rewards), use_container_width=True)
+    with col_rl2:
+        st.subheader("Optimal Policy Matrix")
+        st.markdown("""
+        Below is the learned optimal pacing/pitting policy mapping for the driver's current vehicle state:
+        """)
+        
+        # Build policy map dataframe for display
+        states_list = []
+        policies_list = []
+        action_names = {0: "Push (Aggressive)", 1: "Save (Tyres)", 2: "Pit Stop"}
+        
+        # Enumerate key state combinations
+        # Lap bins: 0=Early, 1=Mid, 2=Late
+        # Wear bins: 0=Fresh, 1=Worn, 2=Critical
+        # Traffic bins: 0=Clean, 1=Traffic
+        for lap_val, lap_name in [(0, "Early stint"), (1, "Mid stint"), (2, "Late stint")]:
+            for wear_val, wear_name in [(0, "Fresh"), (1, "Worn"), (2, "Critical")]:
+                for traffic_val, traffic_name in [(0, "Clean Air"), (1, "Traffic")]:
+                    state = (lap_val, wear_val, traffic_val)
+                    q_vals = [agent.get_q_value(state, a) for a in [0, 1, 2]]
+                    best_action = np.argmax(q_vals)
+                    states_list.append(f"{lap_name} | {wear_name} | {traffic_name}")
+                    policies_list.append(action_names[best_action])
+                    
+        policy_df = pd.DataFrame({
+            'Vehicle State (Lap | Tyre | Traffic)': states_list,
+            'Recommended RL Action': policies_list
+        })
+        st.dataframe(policy_df, height=350)
+        
+    st.markdown("---")
+    
+    # === Section 8: Circuit Constraints ===
     st.header("Circuit Parameters")
     track_characteristics = {
         "Silverstone": {"tire_deg": "High", "overtaking": "Medium", "key_sectors": "Sectors 1 & 2"},
@@ -751,7 +829,7 @@ if not data.empty and not show_demo:
             *   **Focus**: Prioritize tyre temperature stabilization on out-laps.
             """)
         
-    # === Section 8: Advanced View ===
+    # === Section 9: Advanced View ===
     if advanced_view:
         st.header("Advanced Statistical Analysis")
         col_adv1, col_adv2 = st.columns(2)
@@ -840,3 +918,31 @@ else:
         st.plotly_chart(plot_control_trajectories(mock_data['LapNumber'], opt_results['u'], opt_results['b']), use_container_width=True)
     with col_c2:
         st.plotly_chart(plot_state_variables(mock_data['LapNumber'], opt_results['h'], opt_results['E']), use_container_width=True)
+        
+    # Chapter 7 in Demo Mode
+    env = F1Environment(mock_data)
+    agent = QLearningAgent(lr=0.1, discount=0.95, epsilon=rl_epsilon)
+    rewards, rolling_rewards = train_agent(env, agent, episodes=rl_episodes)
+    
+    col_rl1, col_rl2 = st.columns([2, 1])
+    with col_rl1:
+        st.plotly_chart(plot_rl_convergence(rolling_rewards), use_container_width=True)
+    with col_rl2:
+        states_list = []
+        policies_list = []
+        action_names = {0: "Push (Aggressive)", 1: "Save (Tyres)", 2: "Pit Stop"}
+        
+        for lap_val, lap_name in [(0, "Early stint"), (1, "Mid stint"), (2, "Late stint")]:
+            for wear_val, wear_name in [(0, "Fresh"), (1, "Worn"), (2, "Critical")]:
+                for traffic_val, traffic_name in [(0, "Clean Air"), (1, "Traffic")]:
+                    state = (lap_val, wear_val, traffic_val)
+                    q_vals = [agent.get_q_value(state, a) for a in [0, 1, 2]]
+                    best_action = np.argmax(q_vals)
+                    states_list.append(f"{lap_name} | {wear_name} | {traffic_name}")
+                    policies_list.append(action_names[best_action])
+                    
+        policy_df = pd.DataFrame({
+            'Vehicle State (Lap | Tyre | Traffic)': states_list,
+            'Recommended RL Action': policies_list
+        })
+        st.dataframe(policy_df, height=350)

@@ -4,6 +4,7 @@ import pandas as pd
 from src.game_theory import GameTheoryStrategist
 from src.trust_analysis import TrustAnalyzer
 from src.differential_games import F1TrajectoryOptimizer
+from src.reinforcement_learning import F1Environment, QLearningAgent, train_agent
 
 class TestMotorsportsModels(unittest.TestCase):
     
@@ -196,6 +197,38 @@ class TestMotorsportsModels(unittest.TestCase):
         # 2. Battery SoC constraint verification (must remain non-negative and <= 4.0)
         self.assertTrue(np.all(res['E'] >= -1e-4))
         self.assertTrue(np.all(res['E'] <= 4.0 + 1e-4))
+
+    def test_rl_environment_transitions(self):
+        env = F1Environment(self.mock_data)
+        state = env.reset()
+        
+        # Initial state should be early lap, fresh tyre, clean air
+        self.assertEqual(state, (0, 0, 0))
+        
+        # Take a Push step
+        next_state, reward, done = env.step(action=0)
+        self.assertEqual(env.current_lap, 1)
+        self.assertAlmostEqual(env.tire_wear, 0.035, places=5)
+        
+        # Incur tire blowout
+        env.tire_wear = 1.0
+        _, reward_blowout, done_blowout = env.step(action=0)
+        self.assertTrue(done_blowout)
+        self.assertLess(reward_blowout, -50.0)
+
+    def test_rl_agent_training_success(self):
+        env = F1Environment(self.mock_data)
+        agent = QLearningAgent(actions=[0, 1, 2], lr=0.1, discount=0.9, epsilon=0.2)
+        
+        # Train agent over a few episodes
+        episodes_count = 50
+        history, rolling = train_agent(env, agent, episodes=episodes_count)
+        
+        self.assertEqual(len(history), episodes_count)
+        self.assertEqual(len(rolling), episodes_count)
+        
+        # Q-table should have learned mappings
+        self.assertGreater(len(agent.q_table), 0)
 
 if __name__ == '__main__':
     unittest.main()
