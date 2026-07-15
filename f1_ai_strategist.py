@@ -19,6 +19,7 @@ from src.differential_games import F1TrajectoryOptimizer
 from src.reinforcement_learning import F1Environment, QLearningAgent, train_agent
 from src.monte_carlo import F1MonteCarloSimulator
 from src.race_replay import F1RaceReplay
+from src.strategy_comparison import F1StrategyComparisonEngine
 
 # ========== Streamlit Configuration & Styling ==========
 st.set_page_config(page_title="F1 Strategy Engineer Toolkit", layout="wide")
@@ -60,7 +61,7 @@ h1, h2, h3, h4, h5, h6 {
 """, unsafe_allow_html=True)
 
 st.title("F1 Strategy Engineer Toolkit")
-st.caption("SOLID Game Theory, Thermodynamic Degradation & Machine Learning System - v7.1 | July 2026")
+st.caption("SOLID Game Theory, Thermodynamic Degradation & Machine Learning System - v7.2 | July 2026")
 
 # ========== Global Plot Styling Config (No Gradients) ==========
 PLOTLY_LAYOUT = dict(
@@ -102,7 +103,6 @@ with st.sidebar:
     deg_scale_val = st.slider("Tire Degradation Scale", 0.5, 2.0, float(track_cfg.degradation_scale))
     overtake_index_val = st.slider("Overtaking Index", 0.1, 2.5, float(track_cfg.overtaking_index))
     
-    # Override CONFIG values dynamically
     track_cfg.pit_loss = pit_loss_val
     track_cfg.degradation_scale = deg_scale_val
     track_cfg.overtaking_index = overtake_index_val
@@ -404,7 +404,6 @@ if not data.empty:
         for lap_val, lap_name in [(0, "Early stint"), (2, "Late stint")]:
             for wear_val, wear_name in [(0, "Fresh"), (2, "Critical")]:
                 for fuel_val, fuel_name in [(0, "Light fuel"), (1, "Heavy fuel")]:
-                    # State format: (lap, wear, temp, fuel, gap, weather, drs, sc, ers)
                     state = (lap_val, wear_val, 1, fuel_val, 0, 0, 0, 0, 1)
                     best_action = np.argmax([rl_agent.get_q_value(state, a) for a in range(5)])
                     states_list.append(f"{lap_name} | {wear_name} | {fuel_name}")
@@ -464,8 +463,54 @@ if not data.empty:
 
     st.markdown("---")
 
-    # === Chapter 8: Real Race Replay & Strategy Audit ===
-    st.header("Chapter 8: Live Race Replay & Strategy Audit")
+    # === Chapter 9: Strategy Comparison Engine ===
+    st.header("Chapter 9: Strategy Comparison Engine")
+    st.markdown("""
+    This section evaluates Strategy A (1-Stop) against Strategy B (2-Stop) profiles, running Monte Carlo simulations 
+    and generating tactical trade-off suggestions.
+    """)
+    
+    col_comp_params1, col_comp_params2 = st.columns(2)
+    with col_comp_params1:
+        one_stop_target = st.slider("Strategy A (1-Stop) Pit Lap", 5, len(data)-5, int(len(data)*0.5))
+    with col_comp_params2:
+        two_stop_target1 = st.slider("Strategy B (2-Stop) Pit Lap 1", 5, len(data)-10, int(len(data)*0.3))
+        two_stop_target2 = st.slider("Strategy B (2-Stop) Pit Lap 2", two_stop_target1+3, len(data)-5, int(len(data)*0.7))
+        
+    comp_engine = F1StrategyComparisonEngine(data, sc_probs)
+    with st.spinner("Analyzing strategy comparison..."):
+        comp_results = comp_engine.compare(one_stop_target, two_stop_target1, two_stop_target2, trials=mc_trials)
+        
+    st.info(comp_results['recommendation_text'])
+    
+    col_c9_1, col_c9_2 = st.columns([2, 1])
+    with col_c9_1:
+        fig_comp = go.Figure()
+        fig_comp.add_trace(go.Histogram(x=comp_results['times_a'], name="Strategy A (1-Stop)", marker_color='#3b82f6', opacity=0.6))
+        fig_comp.add_trace(go.Scatter(x=comp_results['times_b'], name="Strategy B (2-Stop)", mode='markers', marker=dict(color='#e10600', opacity=0.4)))
+        fig_comp.update_layout(**PLOTLY_LAYOUT, title="Strategy Stint Duration Comparisons", barmode='overlay')
+        st.plotly_chart(fig_comp, use_container_width=True)
+    with col_c9_2:
+        st.subheader("Comparison Metric Table")
+        comp_df = pd.DataFrame({
+            'Stint Outcome': ['Expected Time (Mean)', 'Volatility (Std Dev)', 'Podium Probability'],
+            'Strategy A (1-Stop)': [
+                f"{comp_results['A']['mean']:.2f}s",
+                f"{comp_results['A']['std_dev']:.2f}s",
+                f"{comp_results['A']['podium_probability']:.1%}"
+            ],
+            'Strategy B (2-Stop)': [
+                f"{comp_results['B']['mean']:.2f}s",
+                f"{comp_results['B']['std_dev']:.2f}s",
+                f"{comp_results['B']['podium_probability']:.1%}"
+            ]
+        }).set_index('Stint Outcome')
+        st.dataframe(comp_df)
+
+    st.markdown("---")
+
+    # === Chapter 10: Real Race Replay & Strategy Audit ===
+    st.header("Chapter 10: Live Race Replay & Strategy Audit")
     st.markdown("""
     This section replays the historical stint telemetry lap-by-lap, using our thermodynamic wear models, 
     Bayesian SC estimators, and Strategy Confidence networks. It audits the actual team pit decisions 
@@ -477,7 +522,6 @@ if not data.empty:
     
     col_c8_1, col_c8_2 = st.columns([2, 1])
     with col_c8_1:
-        # Plot Confidence timeline with Pit Actions highlighted as scatter dots
         fig_replay = go.Figure()
         fig_replay.add_trace(go.Scatter(x=replay_df['Lap'], y=replay_df['StrategyConfidence'], name="AI Strategy Confidence", line=dict(color='#3b82f6', width=3)))
         fig_replay.add_trace(go.Scatter(x=replay_df['Lap'], y=replay_df['SafetyCarThreat'], name="SC Threat Level", line=dict(color='#eab308', width=2, dash='dash')))
@@ -503,7 +547,6 @@ if not data.empty:
     with col_c8_2:
         st.subheader("Strategy Audit Report")
         
-        # Overtakes, pit stop timing mismatch, alignment index
         alignment_score = 1.0 - (replay_df['StrategyDeviation'].mean())
         pit_laps_act = list(replay_df[replay_df['ActualAction'] == 'Pit Stop']['Lap'])
         pit_laps_ai = list(replay_df[replay_df['AIRecommendedAction'] == 'Pit Stop']['Lap'])

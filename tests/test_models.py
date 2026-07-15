@@ -11,6 +11,7 @@ from src.differential_games import F1TrajectoryOptimizer
 from src.reinforcement_learning import F1Environment, QLearningAgent, train_agent
 from src.monte_carlo import F1MonteCarloSimulator
 from src.race_replay import F1RaceReplay
+from src.strategy_comparison import F1StrategyComparisonEngine
 
 class TestF1ModelsExpanded(unittest.TestCase):
     
@@ -121,6 +122,16 @@ class TestF1ModelsExpanded(unittest.TestCase):
         self.assertIn('StrategyConfidence', results.columns)
         self.assertIn('SafetyCarThreat', results.columns)
         self.assertIn('AIRecommendedAction', results.columns)
+
+    def test_strategy_comparison_recommendations(self):
+        sc_probs = np.full(self.laps_count, 0.05)
+        engine = F1StrategyComparisonEngine(self.mock_data, sc_probs)
+        results = engine.compare(one_stop_lap=10, two_stop_lap1=6, two_stop_lap2=14, trials=30)
+        
+        self.assertIn('A', results)
+        self.assertIn('B', results)
+        self.assertIn('recommendation_text', results)
+        self.assertIn('recommendation_code', results)
 
 if __name__ == '__main__':
     unittest.main()
