@@ -5,6 +5,7 @@ from src.game_theory import GameTheoryStrategist
 from src.trust_analysis import TrustAnalyzer
 from src.differential_games import F1TrajectoryOptimizer
 from src.reinforcement_learning import F1Environment, QLearningAgent, train_agent
+from src.monte_carlo import F1MonteCarloSimulator
 
 class TestMotorsportsModels(unittest.TestCase):
     
@@ -229,6 +230,32 @@ class TestMotorsportsModels(unittest.TestCase):
         
         # Q-table should have learned mappings
         self.assertGreater(len(agent.q_table), 0)
+
+    def test_monte_carlo_simulation_runs(self):
+        simulator = F1MonteCarloSimulator(self.mock_data)
+        sc_probs = np.full(self.laps_count, 0.05)
+        nash_strat = np.ones(self.laps_count)
+        
+        trials = 120
+        results = simulator.run_simulation(nash_strat, sc_probs, trials=trials)
+        
+        self.assertEqual(len(results), trials)
+        self.assertTrue(np.all(results > 0.0))
+
+    def test_monte_carlo_risk_calculations(self):
+        simulator = F1MonteCarloSimulator(self.mock_data)
+        sc_probs = np.full(self.laps_count, 0.10)
+        nash_strat = np.ones(self.laps_count)
+        
+        results = simulator.run_simulation(nash_strat, sc_probs, trials=100)
+        metrics = simulator.calculate_risk_metrics(results)
+        
+        # Verify keys and positive standard deviation
+        self.assertIn('mean', metrics)
+        self.assertIn('std_dev', metrics)
+        self.assertIn('var_95', metrics)
+        self.assertGreater(metrics['std_dev'], 0.0)
+        self.assertGreater(metrics['var_95'], metrics['mean'])
 
 if __name__ == '__main__':
     unittest.main()

@@ -10,6 +10,7 @@ from src.game_theory import GameTheoryStrategist
 from src.trust_analysis import TrustAnalyzer
 from src.differential_games import F1TrajectoryOptimizer
 from src.reinforcement_learning import F1Environment, QLearningAgent, train_agent
+from src.monte_carlo import F1MonteCarloSimulator
 
 # ========== Configuration ==========
 AVAILABLE_RACES = [
@@ -380,6 +381,35 @@ def plot_rl_convergence(rolling_rewards):
     fig.update_yaxes(title_text="Mean Episode Reward")
     return fig
 
+def plot_mc_distributions(nash_times, stack_times):
+    """Plot Monte Carlo simulated stint completion distributions"""
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=nash_times,
+        name="Nash (Conservative)",
+        xbins=dict(size=1.0),
+        marker_color='#3b82f6',
+        opacity=0.6,
+        hovertemplate='Stint time: %{x}s<br>Count: %{y}<extra></extra>'
+    ))
+    fig.add_trace(go.Histogram(
+        x=stack_times,
+        name="Stackelberg (Aggressive)",
+        xbins=dict(size=1.0),
+        marker_color='#e10600',
+        opacity=0.6,
+        hovertemplate='Stint time: %{x}s<br>Count: %{y}<extra></extra>'
+    ))
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text="Stint Completion Time Distributions", font=dict(size=16, color='#f3f4f6')),
+        barmode='overlay',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.update_xaxes(title_text="Total Stint Duration (seconds)")
+    fig.update_yaxes(title_text="Simulation Trial Frequency")
+    return fig
+
 # ========== Streamlit Interface & Custom Styles ==========
 st.set_page_config(page_title="F1 Strategy Engineer Toolkit", layout="wide")
 
@@ -421,7 +451,7 @@ h1, h2, h3, h4, h5, h6 {
 """, unsafe_allow_html=True)
 
 st.title("F1 Strategy Engineer Toolkit")
-st.caption("Game Theory & Machine Learning System - v5.0 | July 2026")
+st.caption("Game Theory & Machine Learning System - v6.0 | July 2026")
 
 # === Controls ===
 with st.sidebar:
@@ -454,6 +484,11 @@ with st.sidebar:
                             help="Total number of simulated training trials for the Q-learning agent.")
     rl_epsilon = st.slider("Exploration Rate (Epsilon)", min_value=0.05, max_value=0.50, value=0.15, step=0.05,
                            help="Initial rate of random search selections decaying dynamically over training.")
+    
+    st.markdown("---")
+    st.subheader("Monte Carlo Risk Simulator")
+    mc_trials = st.slider("Monte Carlo Trials", min_value=100, max_value=5000, value=1000, step=100,
+                          help="Number of randomized timeline simulation runs.")
 
 # Load Race Data
 data = load_race_data(year, track, driver)
@@ -794,7 +829,58 @@ if not data.empty and not show_demo:
         
     st.markdown("---")
     
-    # === Section 8: Circuit Constraints ===
+    # === Chapter 8: Monte Carlo Strategy Simulation & Risk Assessment ===
+    st.header("Chapter 8: Monte Carlo Strategy Simulation and Risk Assessment")
+    st.markdown("""
+    While expected value payoffs identify baseline strategies, strategy engineers require variance and risk profiles. 
+    Using a **Monte Carlo simulator**, we run thousands of randomized race iterations.
+    
+    On each lap, the simulator evaluates the probability of a safety car deployment $P(\text{SC}_k)$. If triggered, 
+    the pit stops and lap durations are updated dynamically. This generates a probability distribution of total stint completion times.
+    """)
+    
+    # Setup simulator
+    simulator = F1MonteCarloSimulator(data)
+    with st.spinner("Running Monte Carlo Simulations..."):
+        nash_times = simulator.run_simulation(nash, sc_probs, trials=mc_trials)
+        stack_times = simulator.run_simulation(stackelberg, sc_probs, trials=mc_trials)
+        
+    col_mc1, col_mc2 = st.columns([2, 1])
+    with col_mc1:
+        st.plotly_chart(plot_mc_distributions(nash_times, stack_times), use_container_width=True)
+    with col_mc2:
+        st.subheader("Strategic Risk Assessment")
+        st.markdown("""
+        Variance and worst-case Value-at-Risk ($\text{VaR}_{0.95}$) comparison:
+        """)
+        
+        nash_metrics = simulator.calculate_risk_metrics(nash_times)
+        stack_metrics = simulator.calculate_risk_metrics(stack_times)
+        
+        risk_df = pd.DataFrame({
+            'Risk Metric': ['Expected Stint Time (Mean)', 'Strategic Volatility (Std Dev)', '95% Worst-Case VaR'],
+            'Nash (Conservative)': [
+                f"{nash_metrics['mean']:.2f}s",
+                f"{nash_metrics['std_dev']:.2f}s",
+                f"{nash_metrics['var_95']:.2f}s"
+            ],
+            'Stackelberg (Aggressive)': [
+                f"{stack_metrics['mean']:.2f}s",
+                f"{stack_metrics['std_dev']:.2f}s",
+                f"{stack_metrics['var_95']:.2f}s"
+            ]
+        }).set_index('Risk Metric')
+        st.dataframe(risk_df)
+        
+        st.markdown(f"""
+        *Interpretation*: 
+        *   **Volatility (Std Dev)** represents strategic uncertainty. A higher standard deviation indicates greater vulnerability to traffic and safety car timing.
+        *   **95% VaR** shows the worst-case scenario stint time (e.g. under severe traffic or delayed pit releases).
+        """)
+        
+    st.markdown("---")
+    
+    # === Section 9: Circuit Constraints ===
     st.header("Circuit Parameters")
     track_characteristics = {
         "Silverstone": {"tire_deg": "High", "overtaking": "Medium", "key_sectors": "Sectors 1 & 2"},
@@ -829,7 +915,7 @@ if not data.empty and not show_demo:
             *   **Focus**: Prioritize tyre temperature stabilization on out-laps.
             """)
         
-    # === Section 9: Advanced View ===
+    # === Section 10: Advanced View ===
     if advanced_view:
         st.header("Advanced Statistical Analysis")
         col_adv1, col_adv2 = st.columns(2)
@@ -946,3 +1032,31 @@ else:
             'Recommended RL Action': policies_list
         })
         st.dataframe(policy_df, height=350)
+        
+    # Chapter 8 in Demo Mode
+    simulator = F1MonteCarloSimulator(mock_data)
+    nash_times = simulator.run_simulation(nash, sc_probs, trials=mc_trials)
+    stack_times = simulator.run_simulation(stackelberg, sc_probs, trials=mc_trials)
+    
+    col_mc1, col_mc2 = st.columns([2, 1])
+    with col_mc1:
+        st.plotly_chart(plot_mc_distributions(nash_times, stack_times), use_container_width=True)
+    with col_mc2:
+        st.subheader("Strategic Risk Assessment")
+        nash_metrics = simulator.calculate_risk_metrics(nash_times)
+        stack_metrics = simulator.calculate_risk_metrics(stack_times)
+        
+        risk_df = pd.DataFrame({
+            'Risk Metric': ['Expected Stint Time (Mean)', 'Strategic Volatility (Std Dev)', '95% Worst-Case VaR'],
+            'Nash (Conservative)': [
+                f"{nash_metrics['mean']:.2f}s",
+                f"{nash_metrics['std_dev']:.2f}s",
+                f"{nash_metrics['var_95']:.2f}s"
+            ],
+            'Stackelberg (Aggressive)': [
+                f"{stack_metrics['mean']:.2f}s",
+                f"{stack_metrics['std_dev']:.2f}s",
+                f"{stack_metrics['var_95']:.2f}s"
+            ]
+        }).set_index('Risk Metric')
+        st.dataframe(risk_df)
