@@ -11,7 +11,9 @@ class GameTheoryStrategist:
     def __init__(self, data: pd.DataFrame, traffic_penalty: float = 0.15):
         self.data = data.copy()
         self.laps = len(data)
-        self.base_confidence = data['Trust'].values if 'Trust' in data.columns else np.full(self.laps, 0.8)
+        if 'StrategyConfidence' not in data.columns:
+            raise ValueError("StrategyConfidence must be calculated before game-theory evaluation")
+        self.base_confidence = data['StrategyConfidence'].to_numpy(dtype=float)
         self.traffic_penalty = traffic_penalty
 
     def calculate_utility(self, strategy_self: np.ndarray, strategy_comp: np.ndarray, sc_active: bool = False) -> float:
@@ -115,15 +117,7 @@ class GameTheoryStrategist:
             
         return float(np.clip(p_a, 0.0, 1.0)), float(np.clip(q_b, 0.0, 1.0))
         
-    def calculate_sc_probability(self, track_name: str) -> np.ndarray:
-        """
-        Track baseline safety car probabilities (returns array of shape self.laps).
-        """
-        p_base = 0.015 if track_name and "Silverstone" in track_name else 0.010
-        sc_probs = np.full(self.laps, p_base)
-        if self.laps > 0:
-            sc_probs[0] = min(p_base * 3.0, 1.0)
-        return sc_probs
+
         
     def calculate_expected_payoff(self, strat_a: np.ndarray, strat_b: np.ndarray, sc_probs: np.ndarray) -> Tuple[float, float]:
         """

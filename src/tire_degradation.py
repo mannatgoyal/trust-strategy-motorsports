@@ -8,8 +8,9 @@ class TireDegradationModel:
     Simulates tire temperature transitions, compound wear accumulation, 
     instantaneous grip, and the lap time cliff effect.
     """
-    def __init__(self, compound: str = 'Medium'):
+    def __init__(self, compound: str = 'Medium', degradation_scale: float = 1.0):
         self.compound = compound.lower()
+        self.degradation_scale = degradation_scale
         
         # Load compound configuration parameters from YAML CONFIG
         if self.compound == 'soft':
@@ -62,7 +63,7 @@ class TireDegradationModel:
             
         # 3. Wear accumulation (wear rate escalates with high temperatures)
         temp_wear_modifier = 1.0 + max(0.0, self.temperature - self.cfg.thermal_window_max) * 0.015
-        wear_increment = self.cfg.wear_rate * (push_level ** 1.5) * temp_wear_modifier
+        wear_increment = self.cfg.wear_rate * (push_level ** 1.5) * temp_wear_modifier * self.degradation_scale
         self.wear = float(np.clip(self.wear + wear_increment, 0.0, 1.0))
         
         # 4. Grip coefficient & Cliff effect solver

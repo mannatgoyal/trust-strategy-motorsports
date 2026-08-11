@@ -10,7 +10,7 @@ class TestGameTheoryOptimization(unittest.TestCase):
         self.data = pd.DataFrame({
             'LapNumber': np.arange(1, self.laps + 1),
             'Position': np.ones(self.laps) * 3,
-            'Trust': np.full(self.laps, 0.8),
+            'StrategyConfidence': np.full(self.laps, 0.8),
             'ExitGap': np.full(self.laps, 5.0)
         })
         

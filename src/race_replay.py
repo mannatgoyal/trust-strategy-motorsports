@@ -4,6 +4,7 @@ from typing import Dict, Any, List
 from src.trust_analysis import StrategyConfidenceEstimator
 from src.safety_car import BayesianSafetyCarModel
 from src.tire_degradation import TireDegradationModel
+from src.strategy_engine import recommend_pit
 
 class F1RaceReplay:
     """
@@ -65,11 +66,9 @@ class F1RaceReplay:
             sc_est = self.sc_model.estimate_posterior_probabilities(lap_num, self.track_name, weather_st, recent_incidents)
             sc_threat = sc_est['Combined']
             
-            # 4. AI Pit Window suggestion
-            # AI recommends pitting if tyre wear is critical (wear > 0.60) or safety car active and wear is high
-            ai_pit_recommendation = False
-            if wear > 0.60 or (sc_threat > 0.35 and wear > 0.40):
-                ai_pit_recommendation = True
+            # 4. AI Pit Window suggestion via unified strategy engine
+            ai_pit_recommendation = recommend_pit(wear, sc_threat)
+            if ai_pit_recommendation:
                 self.tyre_model.reset() # Reset tire for next stint
                 
             actual_pit_action = "Stay Out"

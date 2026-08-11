@@ -9,8 +9,9 @@ class PitStopSimulator:
     exit transit, and cold tire grip timing penalties, scaling properties 
     depending on track constraints.
     """
-    def __init__(self):
+    def __init__(self, pit_lane_loss: float = None):
         self.cfg = CONFIG.pit
+        self.pit_lane_loss = pit_lane_loss
         
     def get_track_scaling(self, track_name: str) -> Tuple[float, float]:
         """
@@ -33,11 +34,15 @@ class PitStopSimulator:
         if random_seed is not None:
             np.random.seed(random_seed)
             
-        entry_mult, exit_mult = self.get_track_scaling(track_name)
-        
-        # 1. Entry and Exit transit times
-        entry_time = self.cfg.pit_entry_loss * entry_mult
-        exit_time = self.cfg.pit_exit_loss * exit_mult
+        if self.pit_lane_loss is not None:
+            base_sum = self.cfg.pit_entry_loss + self.cfg.pit_exit_loss
+            scale = self.pit_lane_loss / base_sum
+            entry_time = self.cfg.pit_entry_loss * scale
+            exit_time = self.cfg.pit_exit_loss * scale
+        else:
+            entry_mult, exit_mult = self.get_track_scaling(track_name)
+            entry_time = self.cfg.pit_entry_loss * entry_mult
+            exit_time = self.cfg.pit_exit_loss * exit_mult
         
         # 2. Stationary service (wheel gun) duration with normal variance
         stationary_time = np.random.normal(self.cfg.stationary_mean, self.cfg.stationary_std)

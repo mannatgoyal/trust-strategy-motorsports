@@ -1,7 +1,9 @@
 import os
 import yaml
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Any
+import pandas as pd
+import numpy as np
 
 @dataclass
 class PitConfig:
@@ -118,3 +120,18 @@ def load_config(config_path: str = "configs/race_config.yaml") -> RaceConfig:
 
 # Expose global config singleton
 CONFIG = load_config()
+
+TRACK_ALIASES = {
+    "British Grand Prix": "silverstone",
+    "Abu Dhabi Grand Prix": "yas_marina",
+}
+
+@dataclass
+class RaceContext:
+    year: int
+    track_id: str
+    track_config: TrackOverrideConfig
+    telemetry: pd.DataFrame
+    confidence: np.ndarray
+    sc_probability: np.ndarray
+    weather_profile: list

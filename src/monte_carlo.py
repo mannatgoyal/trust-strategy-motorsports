@@ -17,19 +17,48 @@ class F1MonteCarloSimulator:
     Joint Probability Sampling:
       Weather Dampness -> Driver Pacing Volatility & Overtaking Incidents -> Safety Car Posteriors.
     """
-    def __init__(self, data: pd.DataFrame):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        track_id: str = "silverstone",
+        track_config: Any = None,
+        confidence: np.ndarray = None,
+        sc_probs: np.ndarray = None
+    ):
         self.data = data.copy()
         self.laps = len(data)
-        self.base_trust = data['Trust'].values if 'Trust' in data.columns else np.full(self.laps, 0.8)
+        self.track_id = track_id
         
-    def simulate_trial(self, strategy: np.ndarray, sc_probs: np.ndarray) -> Tuple[float, int]:
+        from src.config import CONFIG
+        self.track_config = track_config if track_config is not None else CONFIG.tracks.get(track_id)
+        
+        if confidence is not None:
+            self.base_confidence = confidence
+        else:
+            if 'StrategyConfidence' in data.columns:
+                self.base_confidence = data['StrategyConfidence'].to_numpy(dtype=float)
+            elif 'Trust' in data.columns:
+                self.base_confidence = data['Trust'].to_numpy(dtype=float)
+            else:
+                raise ValueError("StrategyConfidence must be calculated before Monte Carlo simulation")
+                
+        self.sc_probs = sc_probs
+        
+    def simulate_trial(self, strategy: np.ndarray) -> Tuple[float, int]:
         """
         Simulates a single stint timeline, sampling all random elements jointly.
         """
-        tyre_model = TireDegradationModel(compound='medium')
+        tyre_model = TireDegradationModel(
+            compound='medium',
+            degradation_scale=self.track_config.degradation_scale if self.track_config else 1.0
+        )
         fuel_model = FuelModel(total_laps=self.laps)
-        pit_model = PitStopSimulator()
-        traffic_model = F1TrafficSimulator()
+        pit_model = PitStopSimulator(
+            pit_lane_loss=self.track_config.pit_loss if self.track_config else None
+        )
+        traffic_model = F1TrafficSimulator(
+            overtaking_index=self.track_config.overtaking_index if self.track_config else 1.0
+        )
         sc_model = BayesianSafetyCarModel()
         weather_model = DynamicWeatherSystem(rain_probability=0.12)
         
@@ -59,7 +88,7 @@ class F1MonteCarloSimulator:
             recent_incidents = 1 if np.random.random() < incident_prob else 0
             
             # C. Bayesian Safety Car drawing (posterior updates dynamic incidents)
-            sc_est = sc_model.estimate_posterior_probabilities(k+1, "Silverstone", weather_state, recent_incidents)
+            sc_est = sc_model.estimate_posterior_probabilities(k+1, self.track_id, weather_state, recent_incidents)
             sc_active = np.random.random() < sc_est['Combined']
             
             # Pacing consistency noise (driver error volatility)
@@ -67,7 +96,7 @@ class F1MonteCarloSimulator:
             
             if k == pit_lap:
                 # Pit Stop Simulation
-                stop_results = pit_model.simulate_stop(track_name="Silverstone")
+                stop_results = pit_model.simulate_stop(track_name=self.track_id)
                 pit_time = stop_results['total_loss']
                 if sc_active:
                     # Pit timing benefit under safety car (slower delta loss)
@@ -102,7 +131,7 @@ class F1MonteCarloSimulator:
                 gap_ahead = self.data.loc[k, 'GapAhead'] if 'GapAhead' in self.data.columns else 5.0
                 dirty_air_loss = traffic_model.calculate_dirty_air_penalty(gap_ahead, drs_active=(gap_ahead < 1.0))
                 
-                lap_time = 90.0 - 5.0 * self.base_trust[k] + wear_loss + fuel_loss + dirty_air_loss + pacing_error
+                lap_time = 90.0 - 5.0 * self.base_confidence[k] + wear_loss + fuel_loss + dirty_air_loss + pacing_error
                 
                 # Safety car track speeds
                 if sc_active:
@@ -124,14 +153,18 @@ class F1MonteCarloSimulator:
                 
         return elapsed_time, current_position
 
-    def run_simulation(self, strategy: np.ndarray, sc_probs: np.ndarray, trials: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
+    def run_simulation(self, strategy: np.ndarray, sc_probs: Any = None, trials: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
         """
         Runs M Monte Carlo stint trials.
         """
-        times = np.zeros(trials)
-        positions = np.zeros(trials, dtype=int)
-        for i in range(trials):
-            t, pos = self.simulate_trial(strategy, sc_probs)
+        actual_trials = trials
+        if isinstance(sc_probs, (int, np.integer)):
+            actual_trials = int(sc_probs)
+            
+        times = np.zeros(actual_trials)
+        positions = np.zeros(actual_trials, dtype=int)
+        for i in range(actual_trials):
+            t, pos = self.simulate_trial(strategy)
             times[i] = t
             positions[i] = pos
         return times, positions

@@ -37,9 +37,12 @@ class F1TrajectoryOptimizer:
        To maintain computational efficiency under live stream constraints, the continuous Hamiltonian 
        is discretized over the stint timeline and solved using Sequential Least Squares Programming (SLSQP).
     """
-    def __init__(self, base_trust: np.ndarray, regen_efficiency: float = 0.8, min_tire_health: float = 0.15):
-        self.base_trust = np.array(base_trust)
-        self.laps = len(base_trust)
+    def __init__(self, base_confidence: np.ndarray = None, regen_efficiency: float = 0.8, min_tire_health: float = 0.15, base_trust: np.ndarray = None):
+        confidence_arr = base_confidence if base_confidence is not None else base_trust
+        if confidence_arr is None:
+            raise ValueError("base_confidence must be provided")
+        self.base_confidence = np.array(confidence_arr)
+        self.laps = len(self.base_confidence)
         self.regen_efficiency = regen_efficiency
         self.min_tire_health = min_tire_health
         
@@ -77,7 +80,7 @@ class F1TrajectoryOptimizer:
             accel_benefit = 3.2 * (u[k] - 1.0) + 1.8 * b[k]
             cornering_loss = 2.5 * (1.0 - grip)
             
-            lap_times[k] = (90.0 - 5.0 * self.base_trust[k] 
+            lap_times[k] = (90.0 - 5.0 * self.base_confidence[k] 
                             - accel_benefit 
                             + cornering_loss)
             

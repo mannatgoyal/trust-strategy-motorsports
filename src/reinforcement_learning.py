@@ -22,12 +22,29 @@ class F1Environment:
       - 0: Push (Aggressive throttle, higher ERS deploy, faster lap times)
       - 1: Conserve (Tyre saving lift-and-coast, ERS harvesting)
       - 2: Pit Stop (Refit compound, reset wear & temperatures, pit transit time loss)
-      - 3: Defend (Hold track position, slight timing drag penalty)
+      - 3: Defend (Hold track position, slight pacing drag penalty)
       - 4: Attack (High ERS output, attempt overtake, extra fuel burn)
     """
-    def __init__(self, data: pd.DataFrame):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        track_config: Any = None,
+        sc_probs: np.ndarray = None,
+        confidence: np.ndarray = None,
+        weather_profile: list = None
+    ):
         self.data = data.copy()
         self.total_laps = len(data)
+        
+        from src.config import CONFIG
+        self.track_config = track_config
+        self.sc_probs = sc_probs if sc_probs is not None else np.full(self.total_laps, 0.015)
+        self.confidence = confidence if confidence is not None else (
+            data['StrategyConfidence'].to_numpy() if 'StrategyConfidence' in data.columns else (
+                data['Trust'].to_numpy() if 'Trust' in data.columns else np.full(self.total_laps, 0.8)
+            )
+        )
+        self.weather_profile = weather_profile if weather_profile is not None else [(0.0, 'Dry')] * self.total_laps
         self.reset()
         
     def reset(self) -> Tuple[int, ...]:
@@ -82,12 +99,15 @@ class F1Environment:
         done = False
         reward = 0.0
         
-        # 10% chance of weather dampness fluctuation
-        if random.random() < 0.10:
-            self.dampness = min(1.0, max(0.0, self.dampness + random.choice([-0.1, 0.1])))
+        # Dynamic weather update from the weather profile
+        if self.current_lap < len(self.weather_profile):
+            self.dampness, weather_state = self.weather_profile[self.current_lap]
+        else:
+            self.dampness, weather_state = 0.0, 'Dry'
             
-        # Dynamic Safety Car draw
-        self.sc_active = 1 if random.random() < 0.015 else 0
+        # Dynamic Safety Car draw from the contextual SC probability
+        sc_prob = self.sc_probs[self.current_lap] if self.current_lap < len(self.sc_probs) else 0.015
+        self.sc_active = 1 if random.random() < sc_prob else 0
         
         # Action transitions & timing rewards
         if action == 0:  # Push
@@ -105,7 +125,9 @@ class F1Environment:
             self.battery_energy = min(4.0, self.battery_energy + 0.6) # harvest energy
             
         elif action == 2:  # Pit Stop
-            pit_loss = 12.0 if self.sc_active == 1 else 22.0
+            pit_loss = self.track_config.pit_loss if (self.track_config and hasattr(self.track_config, 'pit_loss')) else 22.0
+            if self.sc_active == 1:
+                pit_loss -= 10.0 # Pit benefit under safety car
             reward -= pit_loss
             self.tire_wear = 0.0
             self.tire_temp = 80.0 # pre-heated blankets temp
@@ -182,6 +204,31 @@ class QLearningAgent:
         max_next_q = max([self.get_q_value(next_state, a) for a in self.actions])
         new_q = old_q + self.lr * (reward + self.discount * max_next_q - old_q)
         self.q_table[(state, action)] = new_q
+
+    def generate_strategy(self, env: F1Environment) -> np.ndarray:
+        """
+        Generates a pacing strategy profile across the stint laps using pure exploitation.
+        """
+        state = env.reset()
+        strategy_profile = []
+        done = False
+        
+        while not done:
+            q_vals = [self.get_q_value(state, a) for a in self.actions]
+            best_action = np.argmax(q_vals)
+            
+            if best_action == 2:  # Pit Stop
+                pace = 0.10
+            elif best_action in [0, 4]:  # Push, Attack
+                pace = 1.10
+            else:  # Conserve, Defend
+                pace = 0.90
+                
+            strategy_profile.append(pace)
+            next_state, _, done = env.step(best_action)
+            state = next_state
+            
+        return np.array(strategy_profile)
 
 def train_agent(env: F1Environment, agent: QLearningAgent, episodes: int = 1000) -> Tuple[list, list]:
     rewards_history = []

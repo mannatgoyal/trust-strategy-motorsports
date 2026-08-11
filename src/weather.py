@@ -98,3 +98,16 @@ class DynamicWeatherSystem:
                 return 0.75
             else:
                 return 0.40 # slicks hydroplane on wet tracks
+
+    def generate_profile(self, laps: int, seed: int = 42) -> list:
+        """
+        Generates a deterministic weather trajectory for a race stint.
+        Returns:
+            list of Tuple[float, str] containing dampness and state name.
+        """
+        self.reset()
+        profile = []
+        for k in range(laps):
+            dampness, state = self.step_lap(k, random_seed=seed)
+            profile.append((dampness, state))
+        return profile

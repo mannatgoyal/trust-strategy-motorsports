@@ -3,6 +3,10 @@ import numpy as np
 import fastf1
 from typing import Dict, Any, Tuple
 
+class TelemetryLoadError(Exception):
+    """Custom exception raised when FastF1 telemetry ingestion fails."""
+    pass
+
 class F1TelemetryPipeline:
     """
     Advanced telemetry loader and processor.
@@ -109,9 +113,11 @@ class F1TelemetryPipeline:
                 })
                 
             return pd.DataFrame(processed_rows)
-        except Exception:
-            # Fallback to simulated data generation
-            return self.generate_synthesized_data()
+        except Exception as exc:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.exception("FastF1 ingestion failed")
+            raise TelemetryLoadError("FastF1 ingestion failed") from exc
 
     def generate_synthesized_data(self, laps: int = 50) -> pd.DataFrame:
         """

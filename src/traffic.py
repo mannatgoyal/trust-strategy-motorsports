@@ -7,8 +7,9 @@ class F1TrafficSimulator:
     Models aerodynamic dirty air wake loss, overtaking probability grids,
     DRS assist zones, and backmarker blue flag offsets.
     """
-    def __init__(self):
+    def __init__(self, overtaking_index: float = 1.0):
         self.cfg = CONFIG.traffic
+        self.overtaking_index = overtaking_index
         
     def calculate_dirty_air_penalty(self, exit_gap: float, drs_active: bool = False) -> float:
         """
@@ -47,7 +48,7 @@ class F1TrafficSimulator:
         drs_factor = 1.5 if (drs_zone and gap < 1.0) else 0.0
         
         # Log-sigmoid logit input
-        logit = (self.cfg.sigmoid_overtake_scale * (
+        logit = (self.cfg.sigmoid_overtake_scale * self.overtaking_index * (
             3.0 * grip_delta 
             + drs_factor 
             + 2.0 * closing_speed
